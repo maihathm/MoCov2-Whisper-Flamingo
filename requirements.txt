@@ -1,13 +1,47 @@
-torch >= 1.8
-opencv-python
-tqdm
-scikit-image
-soundfile
-fairseq
-tensorboardX
-pytorch_lightning
-cmake
-dlib
-h5py
-editdistance
-git+git://github.com/lehduong/torch-warmup-lr.git
+# Deep Learning Framework
+torch>=1.8.0
+torchvision>=0.9.0
+torchaudio>=0.8.0
+pytorch-lightning>=1.5.0
+
+# Audio & Video Processing
+opencv-python>=4.5.0
+soundfile>=0.10.3
+librosa>=0.8.0
+av>=8.0.0  # PyAV for video processing
+dlib>=19.22.0  # Face detection/landmarks
+
+# Machine Learning & Data Processing
+numpy>=1.19.0
+pandas>=1.3.0
+scikit-learn>=0.24.0
+h5py>=3.3.0  # HDF5 file format support
+editdistance>=1.0.0  # For WER calculation
+
+# Transformers & Models
+transformers>=4.15.0  # For Whisper model
+fairseq>=0.10.0  # For additional model architectures
+
+# Utilities & Monitoring
+tensorboard>=2.7.0
+tensorboardX>=2.4  # TensorBoard logging
+tqdm>=4.62.0  # Progress bars
+PyYAML>=5.4.0  # Configuration files
+matplotlib>=3.4.0  # Plotting
+wandb>=0.12.0  # Weights & Biases logging
+
+# Development Tools
+pytest>=6.2.0  # Testing
+black>=21.12b0  # Code formatting
+isort>=5.10.0  # Import sorting
+flake8>=4.0.0  # Code linting
+
+# CUDA Support (optional, version depends on your GPU)
+# cupy-cuda11x  # Uncomment and specify version based on your CUDA version
+
+# Warmup Learning Rate Scheduler
+git+https://github.com/lehduong/torch-warmup-lr.git
+
+# Optional: ONNX Export Support
+onnx>=1.10.0
+onnxruntime>=1.9.0
