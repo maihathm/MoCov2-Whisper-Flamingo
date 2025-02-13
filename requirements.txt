@@ -1,0 +1,13 @@
+torch >= 1.8
+opencv-python
+tqdm
+scikit-image
+soundfile
+fairseq
+tensorboardX
+pytorch_lightning
+cmake
+dlib
+h5py
+editdistance
+git+git://github.com/lehduong/torch-warmup-lr.git
