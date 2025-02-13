@@ -12,8 +12,8 @@ from .samplers import (
 from .transforms import AudioTransform, VideoTransform
 
 
-# https://github.com/facebookresearch/av_hubert/blob/593d0ae8462be128faab6d866a3a926e2955bde1/avhubert/hubert_dataset.py#L517
 def pad(samples, pad_val=0.0):
+    """Pad a batch of samples to the longest sequence."""
     lengths = [len(s) for s in samples]
     max_size = max(lengths)
     sample_shape = list(samples[0].shape[1:])
@@ -36,80 +36,151 @@ def pad(samples, pad_val=0.0):
 
 
 def collate_pad(batch):
+    """
+    Collate function that handles both single modality and audiovisual data
+    with support for gate cross attention
+    """
     batch_out = {}
+    
     for data_type in batch[0].keys():
-        pad_val = -1 if data_type == "target" else 0.0
-        c_batch, sample_lengths = pad(
-            [s[data_type] for s in batch if s[data_type] is not None], pad_val
-        )
+        # Skip if None
+        if all(s[data_type] is None for s in batch):
+            continue
+            
+        # Handle different padding values based on data type
+        if data_type == "target":
+            pad_val = -1
+        elif data_type in ["video_mask", "audio_mask"]:
+            pad_val = 0  # Mask padding
+        else:
+            pad_val = 0.0
+            
+        # Get data and lengths
+        valid_samples = [s[data_type] for s in batch if s[data_type] is not None]
+        c_batch, sample_lengths = pad(valid_samples, pad_val)
+        
+        # Store in output dictionary
         batch_out[data_type + "s"] = c_batch
         batch_out[data_type + "_lengths"] = torch.tensor(sample_lengths)
+        
+        # Add attention mask for gate cross attention if needed
+        if data_type in ["video", "audio"]:
+            attention_mask = torch.zeros(len(batch), c_batch.size(1), dtype=torch.bool)
+            for i, length in enumerate(sample_lengths):
+                attention_mask[i, :length] = True
+            batch_out[f"{data_type}_attention_mask"] = attention_mask
+            
     return batch_out
 
 
 class DataModule(LightningDataModule):
+    """
+    DataModule for handling AVSR data with MOCO v2, Whisper and gate cross attention
+    """
     def __init__(self, cfg=None):
         super().__init__()
         self.cfg = cfg
         self.cfg.gpus = torch.cuda.device_count()
         self.total_gpus = self.cfg.gpus * self.cfg.trainer.num_nodes
+        
+        # Set default batch sizes if not specified
+        self.cfg.data.batch_size = getattr(self.cfg.data, "batch_size", 32)
+        self.cfg.data.val_batch_size = getattr(self.cfg.data, "val_batch_size", 32)
 
-    def _dataloader(self, ds, sampler, collate_fn):
+    def _dataloader(self, ds, sampler, collate_fn, num_workers=4, pin_memory=True):
+        """Create a dataloader with given dataset and sampler"""
         return torch.utils.data.DataLoader(
             ds,
-            num_workers=12,
-            pin_memory=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
             batch_sampler=sampler,
             collate_fn=collate_fn,
         )
 
     def train_dataloader(self):
+        """Create training dataloader with proper transforms and sampling"""
         ds_args = self.cfg.data.dataset
         train_ds = AVDataset(
             root_dir=ds_args.root_dir,
-            label_path=os.path.join(
-                ds_args.root_dir, ds_args.label_dir, ds_args.train_file
-            ),
-            subset="train",
+            split="train",
             modality=self.cfg.data.modality,
             audio_transform=AudioTransform("train"),
             video_transform=VideoTransform("train"),
+            rate_ratio=self.cfg.data.get("rate_ratio", 640)
         )
+        
+        # Use frame-based sampling for videos
         sampler = ByFrameCountSampler(train_ds, self.cfg.data.max_frames)
+        
+        # Handle distributed training
         if self.total_gpus > 1:
             sampler = DistributedSamplerWrapper(sampler)
         else:
             sampler = RandomSamplerWrapper(sampler)
-        return self._dataloader(train_ds, sampler, collate_pad)
+            
+        return self._dataloader(
+            train_ds,
+            sampler,
+            collate_pad,
+            num_workers=self.cfg.data.get("num_workers", 4),
+            pin_memory=True
+        )
 
     def val_dataloader(self):
+        """Create validation dataloader"""
         ds_args = self.cfg.data.dataset
         val_ds = AVDataset(
             root_dir=ds_args.root_dir,
-            label_path=os.path.join(ds_args.root_dir, ds_args.label_dir, ds_args.val_file),
-            subset="val",
+            split="valid",
             modality=self.cfg.data.modality,
             audio_transform=AudioTransform("val"),
             video_transform=VideoTransform("val"),
+            rate_ratio=self.cfg.data.get("rate_ratio", 640)
         )
+        
+        # Use frame-based sampling without shuffling for validation
         sampler = ByFrameCountSampler(
-            val_ds, self.cfg.data.max_frames_val, shuffle=False
+            val_ds,
+            self.cfg.data.max_frames_val,
+            shuffle=False
         )
+        
         if self.total_gpus > 1:
-            sampler = DistributedSamplerWrapper(sampler, shuffle=False, drop_last=True)
-        return self._dataloader(val_ds, sampler, collate_pad)
+            sampler = DistributedSamplerWrapper(
+                sampler,
+                shuffle=False,
+                drop_last=True
+            )
+            
+        return self._dataloader(
+            val_ds,
+            sampler,
+            collate_pad,
+            num_workers=self.cfg.data.get("num_workers", 4),
+            pin_memory=True
+        )
 
     def test_dataloader(self):
+        """Create test dataloader with noise target if specified"""
         ds_args = self.cfg.data.dataset
-        dataset = AVDataset(
+        test_ds = AVDataset(
             root_dir=ds_args.root_dir,
-            label_path=os.path.join(ds_args.root_dir, ds_args.label_dir, ds_args.test_file),
-            subset="test",
+            split="test",
             modality=self.cfg.data.modality,
             audio_transform=AudioTransform(
-                "test", snr_target=self.cfg.decode.snr_target
+                "test",
+                snr_target=self.cfg.decode.get("snr_target", None)
             ),
             video_transform=VideoTransform("test"),
+            rate_ratio=self.cfg.data.get("rate_ratio", 640)
         )
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=None)
-        return dataloader
+        
+        # For testing, we use a simple dataloader without sampling
+        return torch.utils.data.DataLoader(
+            test_ds,
+            batch_size=self.cfg.data.get("test_batch_size", 1),
+            shuffle=False,
+            num_workers=self.cfg.data.get("num_workers", 4),
+            collate_fn=collate_pad,
+            pin_memory=True
+        )

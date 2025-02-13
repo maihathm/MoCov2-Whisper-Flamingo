@@ -1,353 +1,282 @@
-import fairseq
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import whisper
+from transformers import WhisperModel, WhisperConfig
 from torch.nn.utils.rnn import pad_sequence
-from tqdm import tqdm
 
-from utils.decoders import compute_CTC_prob
 from .moco_visual_frontend import MoCoVisualFrontend
-from .utils import PositionalEncoding, conv1dLayers, outputConv, MaskedLayerNorm, generate_square_subsequent_mask
+from .gate_cross_attention import GatedCrossModalFusion, LayerNorm
+from .utils import PositionalEncoding, outputConv, generate_square_subsequent_mask
 
 
 class AVNet(nn.Module):
-
-    def __init__(self, modal, W2Vfile, MoCofile, reqInpLen, modelargs):
-        super(AVNet, self).__init__()
-        dModel, nHeads, numLayers, peMaxLen, audinSize, vidinSize, fcHiddenSize, dropout, numClasses = modelargs
+    """
+    Unified AVSR model with MOCO v2, Whisper, and Flamingo's gate cross attention.
+    Designed for stable execution and ONNX compatibility.
+    """
+    def __init__(self, modal, MoCofile, reqInpLen, modelargs):
+        super().__init__()
+        dModel, nHeads, numLayers, peMaxLen, fcHiddenSize, dropout, numClasses = modelargs
         self.modal = modal
         self.numClasses = numClasses
         self.reqInpLen = reqInpLen
-        # A & V Modal
-        tx_norm = nn.LayerNorm(dModel)
-        self.maskedLayerNorm = MaskedLayerNorm()
-        if self.modal == "AV":
-            self.ModalityNormalization = nn.LayerNorm(dModel)
-        self.EncoderPositionalEncoding = PositionalEncoding(dModel=dModel, maxLen=peMaxLen)
-        # audio
-        if not self.modal == "VO":
-            # front-end
-            wav2vecModel, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task([W2Vfile], arg_overrides={
-                "apply_mask": True,
-                "mask_prob": 0.5,
-                "mask_channel_prob": 0.25,
-                "mask_channel_length": 64,
-                "layerdrop": 0.1,
-                "activation_dropout": 0.1,
-                "feature_grad_mult": 0.0,
-            })
-            wav2vecModel = wav2vecModel[0]
-            wav2vecModel.remove_pretraining_modules()
-            self.wav2vecModel = wav2vecModel
-            # back-end
-            self.audioConv = conv1dLayers(self.maskedLayerNorm, audinSize, dModel, dModel, downsample=True)
-            audioEncoderLayer = nn.TransformerEncoderLayer(d_model=dModel, nhead=nHeads, dim_feedforward=fcHiddenSize, dropout=dropout)
-            self.audioEncoder = nn.TransformerEncoder(audioEncoderLayer, num_layers=numLayers, norm=tx_norm)
-        else:
-            self.wav2vecModel = None
-            self.audioConv = None
-            self.audioEncoder = None
-        # visual
-        if not self.modal == "AO":
-            # front-end
-            visualModel = MoCoVisualFrontend()
-            if MoCofile is not None:
-                visualModel.load_state_dict(torch.load(MoCofile, map_location="cpu"), strict=False)
-            self.visualModel = visualModel
-            # back-end
-            self.videoConv = conv1dLayers(self.maskedLayerNorm, vidinSize, dModel, dModel)
-            videoEncoderLayer = nn.TransformerEncoderLayer(d_model=dModel, nhead=nHeads, dim_feedforward=fcHiddenSize, dropout=dropout)
-            self.videoEncoder = nn.TransformerEncoder(videoEncoderLayer, num_layers=numLayers, norm=tx_norm)
-        else:
-            self.visualModel = None
-            self.videoConv = None
-            self.videoEncoder = None
-        # JointConv for fusion
-        if self.modal == "AV":
-            self.jointConv = conv1dLayers(self.maskedLayerNorm, 2 * dModel, dModel, dModel)
-            jointEncoderLayer = nn.TransformerEncoderLayer(d_model=dModel, nhead=nHeads, dim_feedforward=fcHiddenSize, dropout=dropout)
-            self.jointEncoder = nn.TransformerEncoder(jointEncoderLayer, num_layers=numLayers, norm=tx_norm)
-        self.jointOutputConv = outputConv(self.maskedLayerNorm, dModel, numClasses)
-        self.decoderPositionalEncoding = PositionalEncoding(dModel=dModel, maxLen=peMaxLen)
-        self.embed = torch.nn.Sequential(
-            nn.Embedding(numClasses, dModel),
-            self.decoderPositionalEncoding
+        
+        # Model configuration validation
+        self._validate_config(dModel, nHeads, numLayers, peMaxLen)
+        
+        # Static buffers for efficiency
+        self.register_buffer("positional_embedding", self._get_sinusoids(peMaxLen, dModel), persistent=True)
+        self.register_buffer("modal_switch", torch.eye(3), persistent=True)  # [AV, AO, VO]
+        
+        # Audio Encoder (Always initialize for ONNX compatibility)
+        self.whisper_model = WhisperModel.from_pretrained("openai/whisper-base")
+        for param in self.whisper_model.parameters():
+            param.requires_grad = False
+        self.audio_proj = nn.Linear(self.whisper_model.config.d_model, dModel)
+        self.audio_ln = LayerNorm(dModel)
+            
+        # Visual Encoder (Always initialize for ONNX compatibility)
+        self.visual_model = MoCoVisualFrontend()
+        if MoCofile is not None:
+            self.visual_model.load_state_dict(torch.load(MoCofile, map_location="cpu"), strict=False)
+        self.video_proj = nn.Linear(2048, dModel)
+        self.video_ln = LayerNorm(dModel)
+        # Freeze MOCO parameters
+        for param in self.visual_model.parameters():
+            param.requires_grad = False
+            
+        # Fusion Module (Always initialize for ONNX compatibility)
+        self.fusion_module = GatedCrossModalFusion(
+            d_model=dModel,
+            n_heads=nHeads,
+            n_layers=numLayers // 2,
+            dropout=dropout
         )
-        jointDecoderLayer = nn.TransformerDecoderLayer(d_model=dModel, nhead=nHeads, dim_feedforward=fcHiddenSize, dropout=dropout)
-        self.jointAttentionDecoder = nn.TransformerDecoder(jointDecoderLayer, num_layers=numLayers, norm=tx_norm)
-        self.jointAttentionOutputConv = outputConv("LN", dModel, numClasses)
-        return
+        self.fusion_scalar = nn.Parameter(torch.tensor([1.0]))
+            
+        # Decoder with improved positional encoding
+        self.token_embedding = nn.Embedding(numClasses, dModel)
+        self.decoder_pos_embedding = nn.Parameter(torch.empty(peMaxLen, dModel))
+        nn.init.normal_(self.decoder_pos_embedding, std=0.02)
+        
+        # Decoder layers with LayerNorm
+        self.decoder_ln = LayerNorm(dModel)
+        self.output_ln = LayerNorm(dModel)
+        
+        # Transformer decoder
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=dModel,
+            nhead=nHeads,
+            dim_feedforward=fcHiddenSize,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.decoder = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=numLayers,
+            norm=LayerNorm(dModel)
+        )
+        
+        # Output projection
+        self.output_projection = nn.Linear(dModel, numClasses, bias=False)
 
-    def subNetForward(self, inputBatch, maskw2v):
-        audioBatch, audMask, videoBatch, vidLen = inputBatch
-        if not self.modal == "VO":
-            audioBatch, audMask = self.wav2vecModel.extract_features(audioBatch, padding_mask=audMask, mask=maskw2v)
-            audLen = torch.sum(~audMask, dim=1)
+    def _get_sinusoids(self, length, channels, max_timescale=10000):
+        """Get sinusoidal positional embeddings"""
+        if channels % 2 != 0:
+            raise ValueError(f"Number of channels ({channels}) must be even")
+            
+        log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
+        inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2))
+        scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
+        return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
+
+    def _validate_config(self, dModel, nHeads, numLayers, peMaxLen):
+        """Validate model configuration for stable execution"""
+        if dModel % nHeads != 0:
+            raise ValueError(f"dModel ({dModel}) must be divisible by nHeads ({nHeads})")
+        if peMaxLen > 10000:
+            raise ValueError(f"peMaxLen ({peMaxLen}) should not exceed 10000 for stable positional encoding")
+        if numLayers < 1:
+            raise ValueError(f"numLayers ({numLayers}) must be at least 1")
+
+    @torch.jit.export
+    def get_modal_index(self, modal_str: str) -> int:
+        """Get modal index for ONNX compatibility"""
+        if modal_str == "AV":
+            return 0
+        elif modal_str == "AO":
+            return 1
+        elif modal_str == "VO":
+            return 2
         else:
-            audLen = None
+            return 0  # Default to AV
 
-        if not self.modal == "AO":
-            videoBatch = videoBatch.transpose(1, 2)
-            videoBatch = self.visualModel(videoBatch, vidLen.long())
-            videoBatch = list(torch.split(videoBatch, vidLen.tolist(), dim=0))
+    def forward(self, inputBatch, targetinBatch=None, targetLenBatch=None):
+        """
+        Forward pass with unified handling of all modalities for ONNX compatibility
+        """
+        audioBatch, audioMask, videoBatch, videoLen = inputBatch
+        
+        # Process audio features
+        with torch.no_grad():
+            audio_features = self.whisper_model.encoder(
+                audioBatch,
+                attention_mask=~audioMask
+            )[0]
+        audio_features = self.audio_ln(self.audio_proj(audio_features))
+        audio_features = audio_features + self.positional_embedding[:audio_features.shape[1]]
+        
+        # Process video features
+        video_features = self.visual_model(videoBatch, videoLen)
+        video_features = self.video_ln(self.video_proj(video_features))
+        video_features = video_features + self.positional_embedding[:video_features.shape[1]]
+        
+        # Unified fusion handling
+        modal_idx = self.get_modal_index(self.modal)
+        modal_switch = self.modal_switch[modal_idx]
+        
+        # Fuse features based on modality
+        fused_features = self.fusion_module(
+            audio_features * modal_switch[1],  # Zero if VO
+            video_features * modal_switch[2],  # Zero if AO
+            audio_mask=audioMask if modal_switch[1] else None,
+            video_mask=self.make_padding_mask(videoLen, video_features.shape[1]) if modal_switch[2] else None
+        ) * self.fusion_scalar.tanh() * modal_switch[0]  # Apply fusion only for AV
+        
+        # Select appropriate features based on modality
+        encoder_output = (
+            fused_features * modal_switch[0] +  # AV mode
+            audio_features * modal_switch[1] +  # AO mode
+            video_features * modal_switch[2]    # VO mode
+        )
+            
+        # If in training mode, process with decoder
+        if targetinBatch is not None:
+            # Prepare decoder input
+            decoder_input = self.token_embedding(targetinBatch)
+            decoder_input = decoder_input + self.decoder_pos_embedding[:decoder_input.shape[1]]
+            
+            # Generate masks
+            tgt_mask = generate_square_subsequent_mask(decoder_input.shape[1], device=decoder_input.device)
+            tgt_padding_mask = self.make_padding_mask(targetLenBatch, decoder_input.shape[1])
+            
+            # Decoder forward pass
+            decoder_output = self.decoder(
+                self.decoder_ln(decoder_input),
+                encoder_output,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_padding_mask
+            )
+            
+            # Generate outputs
+            logits = self.output_projection(self.output_ln(decoder_output))
+            return logits
+            
+        return encoder_output
 
-        audioBatch, videoBatch, inputLenBatch, mask = self.makePadding(audioBatch, audLen, videoBatch, vidLen)
-
-        if isinstance(self.maskedLayerNorm, MaskedLayerNorm):
-            self.maskedLayerNorm.SetMaskandLength(mask, inputLenBatch)
-
-        if not self.modal == "VO":
-            audioBatch = audioBatch.transpose(1, 2)
-            audioBatch = self.audioConv(audioBatch)
-            audioBatch = audioBatch.transpose(1, 2).transpose(0, 1)
-            audioBatch = self.EncoderPositionalEncoding(audioBatch)
-            audioBatch = self.audioEncoder(audioBatch, src_key_padding_mask=mask)
-
-        if not self.modal == "AO":
-            videoBatch = videoBatch.transpose(1, 2)
-            videoBatch = self.videoConv(videoBatch)
-            videoBatch = videoBatch.transpose(1, 2).transpose(0, 1)
-            videoBatch = self.EncoderPositionalEncoding(videoBatch)
-            videoBatch = self.videoEncoder(videoBatch, src_key_padding_mask=mask)
-
-        if self.modal == "AO":
-            jointBatch = audioBatch
-        elif self.modal == "VO":
-            jointBatch = videoBatch
-        else:
-            jointBatch = torch.cat([self.ModalityNormalization(audioBatch), self.ModalityNormalization(videoBatch)], dim=2)
-            jointBatch = jointBatch.transpose(0, 1).transpose(1, 2)
-            jointBatch = self.jointConv(jointBatch)
-            jointBatch = jointBatch.transpose(1, 2).transpose(0, 1)
-            jointBatch = self.EncoderPositionalEncoding(jointBatch)
-            jointBatch = self.jointEncoder(jointBatch, src_key_padding_mask=mask)
-
-        return jointBatch, inputLenBatch, mask
-
-    def forward(self, inputBatch, targetinBatch, targetLenBatch, maskw2v):
-        jointBatch, inputLenBatch, mask = self.subNetForward(inputBatch, maskw2v)
-        jointCTCOutputBatch = jointBatch.transpose(0, 1).transpose(1, 2)
-        jointCTCOutputBatch = self.jointOutputConv(jointCTCOutputBatch)
-        jointCTCOutputBatch = jointCTCOutputBatch.transpose(1, 2).transpose(0, 1)
-        jointCTCOutputBatch = F.log_softmax(jointCTCOutputBatch, dim=2)
-
-        targetinBatch = self.embed(targetinBatch.transpose(0, 1))
-        targetinMask = self.makeMaskfromLength(targetinBatch.shape[:-1][::-1], targetLenBatch, targetinBatch.device)
-        squareMask = generate_square_subsequent_mask(targetinBatch.shape[0], targetinBatch.device)
-        jointAttentionOutputBatch = self.jointAttentionDecoder(targetinBatch, jointBatch, tgt_mask=squareMask,
-                                                               tgt_key_padding_mask=targetinMask, memory_key_padding_mask=mask)
-        jointAttentionOutputBatch = jointAttentionOutputBatch.transpose(0, 1).transpose(1, 2)
-        jointAttentionOutputBatch = self.jointAttentionOutputConv(jointAttentionOutputBatch)
-        jointAttentionOutputBatch = jointAttentionOutputBatch.transpose(1, 2)
-
-        outputBatch = (jointCTCOutputBatch, jointAttentionOutputBatch)
-        return inputLenBatch, outputBatch
-
-    def inference(self, inputBatch, maskw2v, device, Lambda, beamWidth, eosIx, blank):
-        encodedBatch, inputLenBatch, mask = self.subNetForward(inputBatch, maskw2v)
-        CTCOutputConv = self.jointOutputConv
-        attentionDecoder = self.jointAttentionDecoder
-        attentionOutputConv = self.jointAttentionOutputConv
-
-        CTCOutputBatch = encodedBatch.transpose(0, 1).transpose(1, 2)
-        CTCOutputBatch = CTCOutputConv(CTCOutputBatch)
-        CTCOutputBatch = CTCOutputBatch.transpose(1, 2)
-        # claim batch and time step
-        batch = CTCOutputBatch.shape[0]
-        T = inputLenBatch.cpu()
-        # claim CTClogprobs and Length
-        CTCOutputBatch = CTCOutputBatch.cpu()
-        CTCOutLogProbs = F.log_softmax(CTCOutputBatch, dim=-1)
-        predictionLenBatch = torch.ones(batch, device=device).long()
-        # init Omega and Omegahat for attention beam search
-        Omega = [[[(torch.tensor([eosIx]), torch.tensor(0), torch.tensor(0))]] for i in range(batch)]
-        Omegahat = [[] for i in range(batch)]
-        # init
-        gamma_n = torch.full((batch, T.max(), beamWidth, self.numClasses), -np.inf).float()
-        gamma_b = torch.full((batch, T.max(), beamWidth, self.numClasses), -np.inf).float()
-        for b in range(batch):
-            gamma_b[b, 0, 0, 0] = 0
-            for t in range(1, T[b]):
-                gamma_n[b, t, 0, 0] = -np.inf
-                gamma_b[b, t, 0, 0] = 0
-                for tao in range(1, t + 1):
-                    gamma_b[b, t, 0, 0] += gamma_b[b, tao - 1, 0, 0] + CTCOutLogProbs[b, tao, blank]
-
-        newhypo = torch.arange(1, self.numClasses).unsqueeze(-1).unsqueeze(0).unsqueeze(0)
-
-        for l in tqdm(range(1, T.max() + 1), leave=False, desc="Regression", ncols=75):
-            predictionBatch = []
-            for i in range(batch):
-                predictionBatch += [x[0] for x in Omega[i][-1][:beamWidth]]
-                Omega[i].append([])
-            predictionBatch = torch.stack(predictionBatch).long().to(device)
-            predictionBatch = self.embed(predictionBatch.transpose(0, 1))
-            targetinMask = torch.zeros(predictionBatch.shape[:-1][::-1], device=device).bool()
-            if not predictionBatch.shape[1] == encodedBatch.shape[1]:
-                encoderIndex = [i for i in range(batch) for j in range(beamWidth)]
-                encodedBatch = encodedBatch[:, encoderIndex, :]
-                mask = mask[encoderIndex]
-                predictionLenBatch = predictionLenBatch[encoderIndex]
-            squareMask = generate_square_subsequent_mask(predictionBatch.shape[0], device)
-            attentionOutputBatch = attentionDecoder(predictionBatch, encodedBatch, tgt_mask=squareMask, tgt_key_padding_mask=targetinMask,
-                                                    memory_key_padding_mask=mask)
-            attentionOutputBatch = attentionOutputBatch.transpose(0, 1).transpose(1, 2)
-            attentionOutputBatch = attentionOutputConv(attentionOutputBatch)
-            attentionOutputBatch = attentionOutputBatch.transpose(1, 2)
-            attentionOutputBatch = F.log_softmax(attentionOutputBatch[:, -1, 1:], dim=-1)
-            attentionOutLogProbs = attentionOutputBatch.unsqueeze(1).cpu()
-
-            # Decode
-            h = []
-            alpha = []
-            for b in range(batch):
-                h.append([])
-                alpha.append([])
-                for o in Omega[b][l - 1][:beamWidth]:
-                    h[b].append([o[0].tolist()])
-                    alpha[b].append([[o[1], o[2]]])
-            h = torch.tensor(h)
-            alpha = torch.tensor(alpha).float()
-            numBeam = alpha.shape[1]
-            recurrnewhypo = torch.repeat_interleave(torch.repeat_interleave(newhypo, batch, dim=0), numBeam, dim=1)
-            h = torch.cat((torch.repeat_interleave(h, self.numClasses - 1, dim=2), recurrnewhypo), dim=-1)
-            alpha = torch.repeat_interleave(alpha, self.numClasses - 1, dim=2)
-            alpha[:, :, :, 1] += attentionOutLogProbs.reshape(batch, numBeam, -1)
-
-            # h = (batch * beam * 39 * hypoLength)
-            # alpha = (batch * beam * 39)
-            # CTCOutLogProbs = (batch * sequence length * 40)
-            # gamma_n or gamma_b = (batch * max time length * beamwidth * 40 <which is max num of candidates in one time step>)
-            CTCHypoLogProbs = compute_CTC_prob(h, alpha[:, :, :, 1], CTCOutLogProbs, T, gamma_n, gamma_b, numBeam, self.numClasses - 1, blank, eosIx)
-            alpha[:, :, :, 0] = Lambda * CTCHypoLogProbs + (1 - Lambda) * alpha[:, :, :, 1]
-            hPaddingShape = list(h.shape)
-            hPaddingShape[-2] = 1
-            h = torch.cat((torch.zeros(hPaddingShape), h), dim=-2)
-
-            activeBatch = (l < T).nonzero().squeeze(-1).tolist()
-            for b in activeBatch:
-                for i in range(numBeam):
-                    Omegahat[b].append((h[b, i, -1], alpha[b, i, -1, 0]))
-
-            alpha = torch.cat((torch.full((batch, numBeam, 1, 2), -np.inf), alpha), dim=-2)
-            alpha[:, :, -1, 0] = -np.inf
-            predictionRes = alpha[:, :, :, 0].reshape(batch, -1).topk(beamWidth, -1).indices
-            for b in range(batch):
-                for pos, c in enumerate(predictionRes[b]):
-                    beam = c // self.numClasses
-                    c = c % self.numClasses
-                    Omega[b][l].append((h[b, beam, c], alpha[b, beam, c, 0], alpha[b, beam, c, 1]))
-                    gamma_n[b, :, pos, 0] = gamma_n[b, :, beam, c]
-                    gamma_b[b, :, pos, 0] = gamma_b[b, :, beam, c]
-            gamma_n[:, :, :, 1:] = -np.inf
-            gamma_b[:, :, :, 1:] = -np.inf
-            predictionLenBatch += 1
-
-        predictionBatch = [sorted(Omegahat[b], key=lambda x: x[1], reverse=True)[0][0] for b in range(batch)]
-        predictionLenBatch = [len(prediction) - 1 for prediction in predictionBatch]
-        return torch.cat([prediction[1:] for prediction in predictionBatch]).int(), torch.tensor(predictionLenBatch).int()
-
-    def attentionAutoregression(self, inputBatch, maskw2v, device, eosIx):
-        encodedBatch, inputLenBatch, mask = self.subNetForward(inputBatch, maskw2v)
-        attentionDecoder = self.jointAttentionDecoder
-        attentionOutputConv = self.jointAttentionOutputConv
-
-        # claim batch and time step
-        batch = encodedBatch.shape[1]
-        T = inputLenBatch.cpu()
-        # claim CTClogprobs and Length
-        predictionLenBatch = torch.ones(batch, device=device).long()
-        endMask = torch.ones(batch, device=device).bool()
-        predictionInpBatch = torch.full((batch, 1), eosIx, device=device).long()
-
-        while endMask.max() and predictionLenBatch.max() < T.max():
-            predictionBatch = self.embed(predictionInpBatch.transpose(0, 1))
-            targetinMask = torch.zeros(predictionBatch.shape[:-1][::-1], device=device).bool()
-            squareMask = generate_square_subsequent_mask(predictionBatch.shape[0], device)
-            attentionOutputBatch = attentionDecoder(predictionBatch, encodedBatch, tgt_mask=squareMask, tgt_key_padding_mask=targetinMask,
-                                                    memory_key_padding_mask=mask)
-            attentionOutputBatch = attentionOutputBatch.transpose(0, 1).transpose(1, 2)
-            attentionOutputBatch = attentionOutputConv(attentionOutputBatch)
-            attentionOutputBatch = attentionOutputBatch.transpose(1, 2)
-            attentionOutputBatch = F.log_softmax(attentionOutputBatch[:, -1, 1:], dim=-1)
-            predictionNewBatch = torch.argmax(attentionOutputBatch, dim=-1) + 1
-            endMask *= ~(predictionNewBatch == eosIx)
-            predictionNewBatch = predictionNewBatch.unsqueeze(0).transpose(0, 1)
-            predictionInpBatch = torch.cat((predictionInpBatch, predictionNewBatch), dim=-1)
-            predictionLenBatch[endMask] += 1
-        predictionInpBatch = torch.cat((predictionInpBatch, torch.full((batch, 1), eosIx, device=device)), dim=-1)
-        return torch.cat([predictionInp[1:predictionLenBatch[b] + 1] for b, predictionInp in enumerate(predictionInpBatch)]).int().cpu(), \
-               predictionLenBatch.int().cpu()
-
-    def makeMaskfromLength(self, maskShape, maskLength, maskDevice):
-        mask = torch.zeros(maskShape, device=maskDevice)
-        mask[(torch.arange(mask.shape[0]), maskLength - 1)] = 1
-        mask = (1 - mask.flip([-1]).cumsum(-1).flip([-1])).bool()
+    def make_padding_mask(self, lengths, max_length):
+        """Create padding mask from lengths"""
+        batch_size = lengths.size(0)
+        mask = torch.arange(max_length, device=lengths.device).expand(batch_size, max_length) >= lengths.unsqueeze(1)
         return mask
 
-    def makePadding(self, audioBatch, audLen, videoBatch, vidLen):
-        if self.modal == "AO":
-            audPadding = audLen % 2
-            mask = (audPadding + audLen) > 2 * self.reqInpLen
-            audPadding = mask * audPadding + (~mask) * (2 * self.reqInpLen - audLen)
-            audLeftPadding = torch.floor(torch.div(audPadding, 2)).int()
-            audRightPadding = torch.ceil(torch.div(audPadding, 2)).int()
-
-            audioBatch = audioBatch.unsqueeze(1).unsqueeze(1)
-            audioBatch = list(audioBatch)
-            for i, _ in enumerate(audioBatch):
-                pad = nn.ReplicationPad2d(padding=(0, 0, audLeftPadding[i], audRightPadding[i]))
-                audioBatch[i] = pad(audioBatch[i][:, :, :audLen[i]]).squeeze(0).squeeze(0)
-
-            audioBatch = pad_sequence(audioBatch, batch_first=True)
-            inputLenBatch = ((audLen + audPadding) // 2).long()
-            mask = self.makeMaskfromLength([audioBatch.shape[0]] + [audioBatch.shape[1] // 2], inputLenBatch, audioBatch.device)
-
-        elif self.modal == "VO":
-            vidPadding = torch.zeros(len(videoBatch)).long().to(vidLen.device)
-
-            mask = (vidPadding + vidLen) > self.reqInpLen
-            vidPadding = mask * vidPadding + (~mask) * (self.reqInpLen - vidLen)
-
-            vidLeftPadding = torch.floor(torch.div(vidPadding, 2)).int()
-            vidRightPadding = torch.ceil(torch.div(vidPadding, 2)).int()
-
-            for i, _ in enumerate(videoBatch):
-                pad = nn.ReplicationPad2d(padding=(0, 0, vidLeftPadding[i], vidRightPadding[i]))
-                videoBatch[i] = pad(videoBatch[i].unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
-
-            videoBatch = pad_sequence(videoBatch, batch_first=True)
-            inputLenBatch = (vidLen + vidPadding).long()
-            mask = self.makeMaskfromLength(videoBatch.shape[:-1], inputLenBatch, videoBatch.device)
-
+    def inference(self, inputBatch, device, Lambda=0.6, beamWidth=5):
+        """
+        Inference with beam search
+        """
+        audioBatch, audioMask, videoBatch, videoLen = inputBatch
+        
+        # Get features
+        if not self.modal == "VO":
+            with torch.no_grad():
+                audio_features = self.whisper_model.encoder(
+                    audioBatch,
+                    attention_mask=~audioMask
+                )[0]
+            audio_features = self.audio_proj(audio_features)
+            
+        if not self.modal == "AO":
+            video_features = self.visual_model(videoBatch, videoLen)
+            video_features = self.video_proj(video_features)
+            
+        # Apply fusion
+        if self.modal == "AV":
+            fused_features = self.fusion_module(
+                audio_features,
+                video_features,
+                audio_mask=audioMask,
+                video_mask=self.make_padding_mask(videoLen, video_features.shape[1])
+            )
+        elif self.modal == "AO":
+            fused_features = audio_features
         else:
-            dismatch = audLen - 2 * vidLen
-            vidPadding = torch.ceil(torch.div(dismatch, 2)).int()
-            vidPadding = vidPadding * (vidPadding > 0)
-            audPadding = 2 * vidPadding - dismatch
-
-            mask = (vidPadding + vidLen) > self.reqInpLen
-            vidPadding = mask * vidPadding + (~mask) * (self.reqInpLen - vidLen)
-            mask = (audPadding + audLen) > 2 * self.reqInpLen
-            audPadding = mask * audPadding + (~mask) * (2 * self.reqInpLen - audLen)
-
-            vidLeftPadding = torch.floor(torch.div(vidPadding, 2)).int()
-            vidRightPadding = torch.ceil(torch.div(vidPadding, 2)).int()
-            audLeftPadding = torch.floor(torch.div(audPadding, 2)).int()
-            audRightPadding = torch.ceil(torch.div(audPadding, 2)).int()
-
-            audioBatch = audioBatch.unsqueeze(1).unsqueeze(1)
-            audioBatch = list(audioBatch)
-            for i, _ in enumerate(audioBatch):
-                pad = nn.ReplicationPad2d(padding=(0, 0, audLeftPadding[i], audRightPadding[i]))
-                audioBatch[i] = pad(audioBatch[i][:, :, :audLen[i]]).squeeze(0).squeeze(0)
-                pad = nn.ReplicationPad2d(padding=(0, 0, vidLeftPadding[i], vidRightPadding[i]))
-                videoBatch[i] = pad(videoBatch[i].unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
-
-            audioBatch = pad_sequence(audioBatch, batch_first=True)
-            videoBatch = pad_sequence(videoBatch, batch_first=True)
-            inputLenBatch = (vidLen + vidPadding).long()
-            mask = self.makeMaskfromLength(videoBatch.shape[:-1], inputLenBatch, videoBatch.device)
-
-        return audioBatch, videoBatch, inputLenBatch, mask
+            fused_features = video_features
+            
+        # Add positional encoding
+        fused_features = self.EncoderPositionalEncoding(fused_features)
+        
+        # Get CTC probabilities
+        ctc_output = self.jointOutputConv(fused_features.transpose(1, 2))
+        ctc_output = ctc_output.transpose(1, 2)
+        ctc_probs = F.softmax(ctc_output, dim=-1)
+        
+        # Initialize beam search
+        batch_size = fused_features.size(0)
+        beam_scores = torch.zeros(batch_size, beamWidth, device=device)
+        beam_seqs = torch.full((batch_size, beamWidth, 1), self.numClasses-1, device=device)  # Start with EOS token
+        beam_lens = torch.ones(batch_size, beamWidth, device=device)
+        
+        # Beam search loop
+        max_length = min(fused_features.size(1) * 2, 200)  # Limit sequence length
+        
+        for step in range(max_length):
+            num_beams = beam_seqs.size(1)
+            
+            # Get decoder input
+            tgt = self.embed(beam_seqs.view(-1, step+1).transpose(0, 1))
+            tgt_mask = generate_square_subsequent_mask(step+1, device)
+            
+            # Expand encoder output for each beam
+            expanded_features = fused_features.unsqueeze(1).expand(-1, num_beams, -1, -1)
+            expanded_features = expanded_features.contiguous().view(batch_size * num_beams, -1, fused_features.size(-1))
+            
+            # Decoder forward pass
+            attn_output = self.jointAttentionDecoder(
+                tgt,
+                expanded_features.transpose(0, 1),
+                tgt_mask=tgt_mask
+            )
+            
+            # Get next token probabilities
+            next_token_logits = self.jointAttentionOutputConv(attn_output[-1].unsqueeze(-1))
+            next_token_logits = next_token_logits.squeeze(-1)
+            next_token_probs = F.softmax(next_token_logits, dim=-1)
+            
+            # Combine CTC and attention scores
+            combined_scores = Lambda * next_token_probs + (1 - Lambda) * ctc_probs[:, step] if step < ctc_probs.size(1) else next_token_probs
+            
+            # Get top k candidates
+            topk_probs, topk_ids = torch.topk(combined_scores, beamWidth, dim=-1)
+            
+            # Update beams
+            new_seqs = torch.cat([beam_seqs, topk_ids.unsqueeze(-1)], dim=-1)
+            new_scores = beam_scores + torch.log(topk_probs)
+            
+            # Select top beams
+            beam_scores, beam_indices = torch.topk(new_scores.view(batch_size, -1), beamWidth, dim=-1)
+            beam_seqs = new_seqs.view(batch_size, -1, step+2).gather(1, beam_indices.unsqueeze(-1).expand(-1, -1, step+2))
+            
+            # Update sequence lengths
+            is_eos = (beam_seqs[:, :, -1] == self.numClasses-1)
+            beam_lens = torch.where(is_eos & (beam_lens == step+1), beam_lens, step+2)
+            
+            # Early stopping if all beams ended
+            if (beam_lens == step+1).all():
+                break
+                
+        # Select best sequence from each batch
+        best_seqs = beam_seqs[:, 0, 1:]  # Remove initial EOS token
+        best_lens = beam_lens[:, 0] - 1   # Adjust length accordingly
+        
+        return best_seqs, best_lens

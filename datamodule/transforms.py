@@ -87,21 +87,27 @@ class AddNoise(torch.nn.Module):
 
 
 class VideoTransform:
+    """Video transforms for MOCO v2"""
     def __init__(self, subset):
+        # MOCO v2 specific transforms
         if subset == "train":
             self.video_pipeline = torch.nn.Sequential(
-                FunctionalModule(lambda x: x / 255.0),
-                torchvision.transforms.RandomCrop(88),
-                torchvision.transforms.Grayscale(),
-                AdaptiveTimeMask(10, 25),
-                torchvision.transforms.Normalize(0.421, 0.165),
+                FunctionalModule(lambda x: x / 255.0),  # Normalize to [0,1]                torchvision.transforms.RandomHorizontalFlip(),
+                torchvision.transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),  # MOCO v2 color augmentation
+                torchvision.transforms.RandomGrayscale(p=0.2),
+                AdaptiveTimeMask(10, 25),  # Temporal masking
+                torchvision.transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],  # ImageNet normalization used by MOCO v2
+                    std=[0.229, 0.224, 0.225]
+                ),
             )
         elif subset == "val" or subset == "test":
             self.video_pipeline = torch.nn.Sequential(
                 FunctionalModule(lambda x: x / 255.0),
-                torchvision.transforms.CenterCrop(88),
-                torchvision.transforms.Grayscale(),
-                torchvision.transforms.Normalize(0.421, 0.165),
+                torchvision.transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]
+                ),
             )
 
     def __call__(self, sample):
@@ -111,11 +117,14 @@ class VideoTransform:
 
 
 class AudioTransform:
+    """Audio transforms compatible with Whisper"""
     def __init__(self, subset, snr_target=None):
+        # Whisper-specific audio transforms
         if subset == "train":
             self.audio_pipeline = torch.nn.Sequential(
-                AdaptiveTimeMask(6400, 16000),
-                AddNoise(),
+                # Whisper uses mel spectrograms, so we focus on frequency masking
+                FunctionalModule(lambda x: self._apply_spec_augment(x)),
+                AddNoise(),  # Add noise for robustness
                 FunctionalModule(
                     lambda x: torch.nn.functional.layer_norm(x, x.shape, eps=1e-8)
                 ),
@@ -129,6 +138,28 @@ class AudioTransform:
                     lambda x: torch.nn.functional.layer_norm(x, x.shape, eps=1e-8)
                 ),
             )
+    
+    def _apply_spec_augment(self, mel_spectrogram):
+        """Apply SpecAugment to mel spectrogram"""
+        # Time warping is not used as per Whisper's implementation
+        
+        # Frequency masking
+        freq_mask_param = 48  # Number of mel frequency channels to mask
+        num_freq_masks = 2
+        
+        for _ in range(num_freq_masks):
+            freq_start = int(torch.randint(0, mel_spectrogram.size(-1) - freq_mask_param, (1,)))
+            mel_spectrogram[..., freq_start:freq_start + freq_mask_param] = 0
+            
+        # Time masking
+        time_mask_param = mel_spectrogram.size(1) // 8  # Max time steps to mask
+        num_time_masks = 2
+        
+        for _ in range(num_time_masks):
+            time_start = int(torch.randint(0, mel_spectrogram.size(1) - time_mask_param, (1,)))
+            mel_spectrogram[:, time_start:time_start + time_mask_param, :] = 0
+            
+        return mel_spectrogram
 
     def __call__(self, sample):
         # sample: T x 1

@@ -1,69 +1,172 @@
-import logging
-
-import numpy as np
+import os
 import torch
-from torch.utils.data import DataLoader
+import argparse
+import editdistance
+import pytorch_lightning as pl
+from tqdm import tqdm
 
-from config import args
-from data.lrs2_dataset import LRS2
-from data.utils import collate_fn
+from config import get_config
+from datamodule.data_module import DataModule
 from models.av_net import AVNet
-from utils.general import inference
+from train import AVSRModule
+
+
+def compute_metrics(predictions, targets):
+    """
+    Compute Word Error Rate (WER) and Character Error Rate (CER)
+    """
+    total_wer, total_cer = 0, 0
+    total_words, total_chars = 0, 0
+    
+    for pred, target in zip(predictions, targets):
+        # Convert to words
+        pred_words = pred.split()
+        target_words = target.split()
+        
+        # Compute WER
+        wer = editdistance.eval(pred_words, target_words)
+        total_wer += wer
+        total_words += len(target_words)
+        
+        # Compute CER
+        cer = editdistance.eval(pred, target)
+        total_cer += cer
+        total_chars += len(target)
+    
+    wer = (total_wer / total_words) * 100 if total_words > 0 else 0
+    cer = (total_cer / total_chars) * 100 if total_chars > 0 else 0
+    
+    return wer, cer
+
+
+def evaluate_model(model, dataloader, device, modality="AV"):
+    """
+    Evaluate model on given dataloader
+    """
+    model.eval()
+    all_predictions = []
+    all_targets = []
+    
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc=f"Evaluating {modality} model"):
+            # Move batch to device
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                    for k, v in batch.items()}
+            
+            # Get model predictions
+            predictions, prediction_lengths = model.model.inference(
+                (batch["audio"], batch["audio_mask"], batch["video"], batch["video_lengths"]),
+                device,
+                Lambda=model.config["model"].get("lambda", 0.6),
+                beamWidth=model.config["model"].get("beam_width", 5)
+            )
+            
+            # Convert predictions and targets to text
+            for pred, pred_len, target, target_len in zip(
+                predictions, prediction_lengths,
+                batch["targets"], batch["target_lengths"]
+            ):
+                pred_text = model.tokenizer.decode(pred[:pred_len].cpu().numpy())
+                target_text = model.tokenizer.decode(target[:target_len].cpu().numpy())
+                
+                all_predictions.append(pred_text)
+                all_targets.append(target_text)
+    
+    # Compute metrics
+    wer, cer = compute_metrics(all_predictions, all_targets)
+    
+    return {
+        "wer": wer,
+        "cer": cer,
+        "predictions": all_predictions,
+        "targets": all_targets
+    }
+
+
+def ablation_study(model, dataloader, device):
+    """
+    Perform ablation study testing different modalities and fusion methods
+    """
+    results = {}
+    
+    # Test audio-only
+    model.model.modal = "AO"
+    results["audio_only"] = evaluate_model(model, dataloader, device, "Audio-only")
+    
+    # Test video-only
+    model.model.modal = "VO"
+    results["video_only"] = evaluate_model(model, dataloader, device, "Video-only")
+    
+    # Test audio-visual with gate cross attention
+    model.model.modal = "AV"
+    results["av_gate"] = evaluate_model(model, dataloader, device, "AV-Gate")
+    
+    return results
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S', filename='info.log', filemode='w')
-    logger = logging.getLogger(__name__)
-    # set seed
-    np.random.seed(args["SEED"])
-    torch.manual_seed(args["SEED"])
-    # check device
-    torch.set_num_threads(args["NUM_CPU_CORE"])
-    torch.cuda.set_device(args["GPU_ID"])
-    gpuAvailable = torch.cuda.is_available()
-    device = torch.device("cuda" if gpuAvailable else "cpu")
-    kwargs = {"num_workers": args["NUM_WORKERS"], "pin_memory": True} if gpuAvailable else {}
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-    # declaring the test dataset and test dataloader
-    noiseParams = {"noiseFile": args["NOISE_FILE"], "noiseProb": 1 if args["TEST_WITH_NOISE"] else 0, "noiseSNR": args["TEST_NOISE_SNR_DB"]}
-    testData = LRS2(args['MODAL'], "test", args["DATA_DIRECTORY"], args["HDF5_FILE"], args["CHAR_TO_INDEX"], args["STEP_SIZE"], False, noiseParams)
-    testLoader = DataLoader(testData, batch_size=args["BATCH_SIZE"], collate_fn=collate_fn, shuffle=False, **kwargs)
-
-    if args["EVAL_LRS2_MODEL_FILE"] is not None:
-        print("\nTrained Model File: %s" % (args["EVAL_LRS2_MODEL_FILE"]))
-        logger.info("\nTrained Model File: %s" % (args["EVAL_LRS2_MODEL_FILE"]))
-
-        # declaring the model,loss function and loading the trained model weights
-        modelargs = (args["DMODEL"], args["TX_ATTENTION_HEADS"], args["TX_NUM_LAYERS"], args["PE_MAX_LENGTH"], args["AUDIO_FEATURE_SIZE"],
-                     args["VIDEO_FEATURE_SIZE"], args["TX_FEEDFORWARD_DIM"], args["TX_DROPOUT"], args["CHAR_NUM_CLASSES"])
-        model = AVNet(args['MODAL'], args['WAV2VEC_FILE'], args['MOCO_FRONTEND_FILE'], args["MAIN_REQ_INPUT_LENGTH"], modelargs)
-        stateDict = torch.load(args["EVAL_LRS2_MODEL_FILE"], map_location=device)['state_dict']
-        msg = model.load_state_dict(stateDict, strict=False)
-        print(msg)
-        logger.info(msg)
-        model.to(device)
-
-        print("\nTesting the trained model .... \n")
-        logger.info("\nTesting the trained model .... \n")
-
-        inferenceParams = {"spaceIx": args["CHAR_TO_INDEX"][" "], "eosIx": args["CHAR_TO_INDEX"]["<EOS>"], "decodeType": args["DECODE_TYPE"],
-                           "beamWidth": args["BEAM_WIDTH"], "modal": args["MODAL"], "Lambda": args["LAMBDA"]}
-
-        testCER, testWER, testPER = inference(model, testLoader, device, logger, inferenceParams)
-
-        print("%sMODAL || Test CER: %.3f || Test WER: %.3f" % (args["MODAL"], testCER, testWER))
-        logger.info("%sMODAL || Test CER: %.3f || Test WER: %.3f" % (args["MODAL"], testCER, testWER))
-
-        print("\nTesting Done.\n")
-        logger.info("\nTesting Done.\n")
-
+    parser = argparse.ArgumentParser(description="Evaluate AVSR model")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument("--ablation", action="store_true", help="Perform ablation study")
+    parser.add_argument("--output", type=str, default="results", help="Output directory for results")
+    args = parser.parse_args()
+    
+    # Get configuration
+    config = get_config()
+    
+    # Initialize data module
+    data_module = DataModule(config)
+    data_module.setup("test")
+    test_dataloader = data_module.test_dataloader()
+    
+    # Load model from checkpoint
+    model = AVSRModule.load_from_checkpoint(
+        args.checkpoint,
+        config=config,
+        strict=False
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    
+    # Create output directory
+    os.makedirs(args.output, exist_ok=True)
+    
+    if args.ablation:
+        # Perform ablation study
+        results = ablation_study(model, test_dataloader, device)
+        
+        # Print and save results
+        print("\nAblation Study Results:")
+        for modality, metrics in results.items():
+            print(f"\n{modality}:")
+            print(f"WER: {metrics['wer']:.2f}%")
+            print(f"CER: {metrics['cer']:.2f}%")
+            
+            # Save detailed results
+            with open(os.path.join(args.output, f"{modality}_results.txt"), "w") as f:
+                for pred, target in zip(metrics["predictions"], metrics["targets"]):
+                    f.write(f"Pred: {pred}\n")
+                    f.write(f"Target: {target}\n")
+                    f.write("-" * 50 + "\n")
     else:
-        print("Path to the trained model file not specified.\n")
-        logger.info("Path to the trained model file not specified.\n")
-
-    return
+        # Evaluate full model
+        results = evaluate_model(model, test_dataloader, device)
+        
+        # Print results
+        print("\nEvaluation Results:")
+        print(f"WER: {results['wer']:.2f}%")
+        print(f"CER: {results['cer']:.2f}%")
+        
+        # Save detailed results
+        with open(os.path.join(args.output, "evaluation_results.txt"), "w") as f:
+            f.write(f"Overall WER: {results['wer']:.2f}%\n")
+            f.write(f"Overall CER: {results['cer']:.2f}%\n\n")
+            f.write("Detailed Results:\n")
+            f.write("=" * 50 + "\n")
+            for pred, target in zip(results["predictions"], results["targets"]):
+                f.write(f"Pred: {pred}\n")
+                f.write(f"Target: {target}\n")
+                f.write("-" * 50 + "\n")
 
 
 if __name__ == "__main__":

@@ -1,39 +1,90 @@
 import os
-
+import numpy as np
 import torch
 import torchaudio
 import torchvision
+import whisper
+from transformers import WhisperProcessor
 
 
-def cut_or_pad(data, size, dim=0):
-    """
-    Pads or trims the data along a dimension.
-    """
-    if data.size(dim) < size:
-        padding = size - data.size(dim)
-        data = torch.nn.functional.pad(data, (0, 0, 0, padding), "constant")
-        size = data.size(dim)
-    elif data.size(dim) > size:
-        data = data[:size]
-    assert data.size(dim) == size
-    return data
+class DataProcessor:
+    def __init__(self):
+        # Initialize Whisper processor for audio
+        self.whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-base")
+        self.whisper_model = whisper.load_model("base")
+        
+        # Constants for processing
+        self.SAMPLE_RATE = 16000
+        self.N_FRAMES = 30  # Number of frames to extract per second
+        self.FRAME_RATE = 30  # Video frame rate
+        
+    def cut_or_pad(self, data, size, dim=0):
+        """
+        Pads or trims the data along a dimension.
+        """
+        if data.size(dim) < size:
+            padding = size - data.size(dim)
+            data = torch.nn.functional.pad(data, (0, 0, 0, padding), "constant")
+            size = data.size(dim)
+        elif data.size(dim) > size:
+            data = data[:size]
+        assert data.size(dim) == size
+        return data
+    
+    def process_audio_whisper(self, waveform):
+        """
+        Process audio using Whisper's preprocessing pipeline
+        """
+        # Convert to float32 if needed
+        if waveform.dtype != torch.float32:
+            waveform = waveform.float()
+            
+        # Normalize audio
+        waveform = waveform / torch.max(torch.abs(waveform))
+        
+        # Convert to mel spectrogram using Whisper's parameters
+        mel = self.whisper_model.mel_filters(waveform)
+        
+        return mel
 
 
-def load_video(path):
-    """
-    rtype: torch, T x C x H x W
-    """
-    vid = torchvision.io.read_video(path, pts_unit="sec", output_format="THWC")[0]
-    vid = vid.permute((0, 3, 1, 2))
-    return vid
+    def load_video(self, path):
+        """
+        Load and preprocess video for MOCO v2
+        rtype: torch, T x C x H x W
+        """
+        # Load video
+        vid = torchvision.io.read_video(path, pts_unit="sec", output_format="THWC")[0]
+        
+        # Convert to correct format for MOCO v2 (T x C x H x W)
+        vid = vid.permute((0, 3, 1, 2))
+        
+        # Ensure consistent frame rate
+        target_frames = int(vid.size(0) * self.FRAME_RATE / self.N_FRAMES)
+        if target_frames != vid.size(0):
+            indices = torch.linspace(0, vid.size(0)-1, target_frames).long()
+            vid = vid[indices]
+            
+        return vid
 
-
-def load_audio(path):
-    """
-    rtype: torch, T x 1
-    """
-    waveform, sample_rate = torchaudio.load(path[:-4] + ".wav", normalize=True)
-    return waveform.transpose(1, 0)
+    def load_audio(self, path):
+        """
+        Load and preprocess audio for Whisper
+        rtype: torch, T x n_mels
+        """
+        # Load audio
+        waveform, sample_rate = torchaudio.load(path[:-4] + ".wav", normalize=True)
+        waveform = waveform.squeeze(0)  # Remove channel dimension
+        
+        # Resample if needed
+        if sample_rate != self.SAMPLE_RATE:
+            resampler = torchaudio.transforms.Resample(sample_rate, self.SAMPLE_RATE)
+            waveform = resampler(waveform)
+            
+        # Process using Whisper's preprocessing
+        mel = self.process_audio_whisper(waveform)
+        
+        return mel
 
 
 class AVDataset(torch.utils.data.Dataset):
@@ -46,6 +97,8 @@ class AVDataset(torch.utils.data.Dataset):
         video_transform,
         rate_ratio=640,
     ):
+        # Initialize data processor
+        self.processor = DataProcessor()
         self.root_dir = root_dir
         self.split = split
         self.modality = modality
@@ -94,22 +147,37 @@ class AVDataset(torch.utils.data.Dataset):
         text = sample['text']
         
         if self.modality == "video":
-            video = load_video(video_path)
+            # Load and process video for MOCO v2
+            video = self.processor.load_video(video_path)
             video = self.video_transform(video)
             return {"input": video, "target": text}
             
         elif self.modality == "audio":
-            audio = load_audio(video_path)  # audio path được tạo từ video path
+            # Load and process audio for Whisper
+            audio = self.processor.load_audio(video_path)
             audio = self.audio_transform(audio)
             return {"input": audio, "target": text}
             
         elif self.modality == "audiovisual":
-            video = load_video(video_path)
-            audio = load_audio(video_path)
-            audio = cut_or_pad(audio, len(video) * self.rate_ratio)
+            # Load and process both modalities
+            video = self.processor.load_video(video_path)
+            audio = self.processor.load_audio(video_path)
+            
+            # Ensure temporal alignment
+            audio = self.processor.cut_or_pad(audio, len(video) * self.rate_ratio)
+            
+            # Apply transforms
             video = self.video_transform(video)
             audio = self.audio_transform(audio)
-            return {"video": video, "audio": audio, "target": text}
+            
+            # Return both modalities for gate cross attention
+            return {
+                "video": video,  # For MOCO v2
+                "audio": audio,  # For Whisper
+                "target": text,
+                "video_mask": torch.ones(video.size(0)),  # For gate cross attention
+                "audio_mask": torch.ones(audio.size(0))   # For gate cross attention
+            }
 
     def __len__(self):
         return len(self.samples)
