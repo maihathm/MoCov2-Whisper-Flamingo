@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from config import args
+from config import MODEL_CONFIG as args
 
 
 class MoCoVisualFrontend(nn.Module):

@@ -10,6 +10,12 @@ MOCO_PRETRAINED = "moco_v2_800ep_pretrain.pth.tar"
 
 # Model configuration
 MODEL_CONFIG = {
+    # Frontend configuration
+    "FRONTEND_DMODEL": 512,    # Frontend model dimension
+    "WORD_NUM_CLASSES": 500,   # Number of word classes
+    "FRAME_LENGTH": 96,        # Frame length for visual frontend
+    "VIDEO_FEATURE_SIZE": 2048, # Size of video features
+    
     # Model dimensions (aligned with Whisper base)
     "d_model": 512,          # Model dimension
     "n_heads": 8,           # Number of attention heads
