@@ -10,15 +10,25 @@ from transformers import WhisperProcessor, WhisperFeatureExtractor, WhisperModel
 logger = logging.getLogger(__name__)
 
 class DataProcessor:
-    def __init__(self):
-        self.whisper_model = WhisperModel.from_pretrained("SageLiao/whisper-small-zh-TW")
-        self.whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-small")
-        self.feature_extractor = WhisperFeatureExtractor.from_pretrained("SageLiao/whisper-small-zh-TW")
+    def __init__(self, tokenizer_name="SageLiao/whisper-small-zh-TW"):
+        logger.info(f"Initializing DataProcessor with tokenizer: {tokenizer_name}")
+        
+        # Initialize Whisper components
+        self.whisper_model = WhisperModel.from_pretrained(tokenizer_name)
+        self.whisper_processor = WhisperProcessor.from_pretrained(tokenizer_name)
+        self.feature_extractor = WhisperFeatureExtractor.from_pretrained(tokenizer_name)
+        self.tokenizer = self.whisper_processor.tokenizer
+        
+        # Freeze Whisper model
         for param in self.whisper_model.parameters():
             param.requires_grad = False
+            
+        # Constants
         self.SAMPLE_RATE = 16000
         self.N_FRAMES = 30
         self.FRAME_RATE = 30
+        
+        logger.info("DataProcessor initialized successfully")
     def cut_or_pad(self, data, size, dim=0):
         current_size = data.size(dim)
         if current_size < size:
@@ -67,8 +77,9 @@ class DataProcessor:
         return mel
 
 class AVDataset(torch.utils.data.Dataset):
-    def __init__(self, root_dir, split, modality, audio_transform, video_transform, rate_ratio=640, max_frames=300):
-        self.processor = DataProcessor()
+    def __init__(self, root_dir, split, modality, audio_transform, video_transform, rate_ratio=640, max_frames=300, tokenizer_name="SageLiao/whisper-small-zh-TW"):
+        logger.info(f"Initializing AVDataset for split: {split}")
+        self.processor = DataProcessor(tokenizer_name)
         self.root_dir = root_dir
         self.split = split
         self.modality = modality
@@ -99,18 +110,47 @@ class AVDataset(torch.utils.data.Dataset):
         sample = self.samples[idx]
         video_path = sample['video_path']
         text = sample['text']
-        return_dict = {"video": None, "audio": None, "video_mask": None, "audio_mask": None, "target": text}
+        
+        # Process text target
+        encoded = self.processor.tokenizer(
+            text,
+            padding=True,
+            truncation=True,
+            max_length=448,  # Whisper's max sequence length
+            return_tensors="pt"
+        )
+        target_ids = encoded.input_ids.squeeze(0)
+        target_length = torch.tensor([len(target_ids)])
+        
+        return_dict = {
+            "video": None,
+            "video_mask": None,
+            "audio": None, 
+            "audio_mask": None,
+            "target_ids": target_ids,
+            "target_text": text,
+            "target_lengths": target_length
+        }
+        
+        # Load and process video if needed
         if self.modality in ["video", "audiovisual"]:
             video = self.processor.load_video(video_path, self.max_frames)
             video = self.video_transform(video)
+            video_mask = torch.ones(video.size(0), dtype=torch.bool)
             return_dict["video"] = video
-            return_dict["video_mask"] = torch.ones(video.size(0))
+            return_dict["video_mask"] = video_mask
+            return_dict["video_lengths"] = torch.tensor([video.size(0)])
+        
+        # Load and process audio if needed
         if self.modality in ["audio", "audiovisual"]:
             audio = self.processor.load_audio(video_path)
             audio = self.processor.cut_or_pad(audio, size=3000, dim=1)
             audio = self.audio_transform(audio)
+            audio_mask = torch.ones(audio.size(0), dtype=torch.bool)
             return_dict["audio"] = audio
-            return_dict["audio_mask"] = torch.ones(audio.size(0))
+            return_dict["audio_mask"] = audio_mask
+            return_dict["audio_lengths"] = torch.tensor([audio.size(0)])
+        
         return return_dict
     def __len__(self):
         return len(self.samples)

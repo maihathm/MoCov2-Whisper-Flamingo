@@ -50,54 +50,91 @@ class AVNet(nn.Module):
     def forward(self, inputBatch):
         if self.enable_logging:
             logger.info("AVNet forward start")
+            
+        # Unpack input batch
         audioBatch, audioMask, videoBatch, videoLen = inputBatch
+        batch_size = audioBatch.size(0)
+        
         if self.enable_logging:
             logger.info(f"Input audio shape: {audioBatch.shape}, mask shape: {audioMask.shape}")
             logger.info(f"Input video shape: {videoBatch.shape}, lengths shape: {videoLen.shape}")
+        
         # Audio branch
-        whisper_out = self.whisper_model.encoder(audioBatch, attention_mask=~audioMask)[0]
+        whisper_out = self.whisper_model.encoder(
+            audioBatch, 
+            attention_mask=~audioMask,
+            output_hidden_states=True
+        )[0]
+        
         if self.enable_logging:
             logger.info(f"Whisper encoder output shape: {whisper_out.shape}")
+            
         audio_features = self.audio_ln(self.audio_proj(whisper_out))
-        if self.enable_logging:
-            logger.info(f"Audio features after projection shape: {audio_features.shape}")
         audio_features = self.pos_enc_audio(audio_features)
+        
         if self.enable_logging:
-            logger.info(f"Audio features after positional encoding shape: {audio_features.shape}")
+            logger.info(f"Audio features final shape: {audio_features.shape}")
+        
         # Video branch
         video_features = self.visual_model(videoBatch, videoLen)
-        if self.enable_logging:
-            logger.info(f"Raw video features shape: {video_features.shape}")
         video_features = self.video_ln(self.video_proj(video_features))
-        if self.enable_logging:
-            logger.info(f"Video features after projection shape: {video_features.shape}")
         video_features = self.pos_enc_video(video_features)
+        
         if self.enable_logging:
-            logger.info(f"Video features after positional encoding shape: {video_features.shape}")
+            logger.info(f"Video features final shape: {video_features.shape}")
+        
+        # Align sequence lengths if needed
         if audio_features.shape[1] != video_features.shape[1]:
-            audio_features = F.interpolate(audio_features.transpose(1, 2),
-                                           size=video_features.shape[1],
-                                           mode='linear',
-                                           align_corners=False).transpose(1, 2)
+            target_len = min(audio_features.shape[1], video_features.shape[1])
+            if audio_features.shape[1] > target_len:
+                audio_features = audio_features[:, :target_len, :]
+                audioMask = audioMask[:, :target_len]
+            else:
+                video_features = video_features[:, :target_len, :]
+                videoLen = torch.clamp(videoLen, max=target_len)
+            
             if self.enable_logging:
-                logger.info(f"Audio features realigned shape: {audio_features.shape}")
+                logger.info(f"Features aligned to length: {target_len}")
+        
+        # Get modality switch
         modal_idx = self.get_modal_index(self.modal)
         modal_switch = self.modal_switch[modal_idx]
+        
+        # Create padding masks
+        audio_padding_mask = audioMask if modal_switch[1] else None
+        video_padding_mask = self.make_padding_mask(videoLen, video_features.shape[1]) if modal_switch[2] else None
+        
+        # Apply modality switches and fusion
+        audio_branch = audio_features * modal_switch[1]
+        video_branch = video_features * modal_switch[2]
+        
         fused_features = self.fusion_module(
-            audio_features * modal_switch[1],
-            video_features * modal_switch[2],
-            audio_mask=audioMask if modal_switch[1] else None,
-            video_mask=self.make_padding_mask(videoLen, video_features.shape[1]) if modal_switch[2] else None
+            audio_branch,
+            video_branch,
+            audio_mask=audio_padding_mask,
+            video_mask=video_padding_mask
         ) * torch.tanh(self.fusion_scalar) * modal_switch[0]
+        
         if self.enable_logging:
             logger.info(f"Fused features shape: {fused_features.shape}")
-        encoder_output = fused_features * modal_switch[0] + audio_features * modal_switch[1] + video_features * modal_switch[2]
+        
+        # Combine features based on modality
+        encoder_output = (
+            fused_features * modal_switch[0] + 
+            audio_features * modal_switch[1] + 
+            video_features * modal_switch[2]
+        )
+        
         if self.enable_logging:
             logger.info(f"Encoder output shape: {encoder_output.shape}")
+        
+        # Generate logits
         logits = self.decoder(encoder_output)
+        
         if self.enable_logging:
-            logger.info(f"Decoder output (logits) shape: {logits.shape}")
+            logger.info(f"Final logits shape: {logits.shape}")
             logger.info("AVNet forward end")
+        
         return logits
     def get_modal_index(self, modal_str: str) -> int:
         if modal_str == "AV":
