@@ -82,8 +82,7 @@ class DataProcessor:
         if sample_rate != self.SAMPLE_RATE:
             resampler = torchaudio.transforms.Resample(sample_rate, self.SAMPLE_RATE)
             waveform = resampler(waveform)
-        mel = self.process_audio_whisper(waveform)
-        return mel
+        return waveform
 
 class AVDataset(torch.utils.data.Dataset):
     def __init__(self, root_dir, split, modality, audio_transform, video_transform, rate_ratio=640, max_frames=300, tokenizer_name="openai/whisper-small"):
@@ -178,7 +177,6 @@ class AVDataset(torch.utils.data.Dataset):
                 
             if self.modality in ["audio", "audiovisual"]:
                 audio = self.processor.load_audio(video_path)
-                audio = self.processor.cut_or_pad(audio, size=3000, dim=1)
                 audio = self.audio_transform(audio)
                 
                 # Ensure consistent audio length

@@ -57,7 +57,7 @@ class AVNet(nn.Module):
         if self.enable_logging:
             logger.info(f"Input audio shape: {audioBatch.shape}, mask shape: {audioMask.shape}")
             logger.info(f"Input video shape: {videoBatch.shape}, lengths shape: {videoLen.shape}")
-        
+        logger.info(f"Input audioBatch shape before Whisper: {audioBatch.shape}")
         # Audio branch
         whisper_out = self.whisper_model.encoder(
             audioBatch, 

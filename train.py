@@ -280,7 +280,7 @@ def main():
         accumulate_grad_batches=config["training"]["accumulate_grad_batches"],
         log_every_n_steps=config["output"]["log_every_n_steps"],
         deterministic=True,
-        # fast_dev_run = True,
+        fast_dev_run = True,
     )
     
     # Train and test

@@ -96,13 +96,12 @@ def pad_or_trim_mel(mel, target_length=3000):
     """
     time_dim = mel.size(-1)
     if time_dim < target_length:
-        # Pad on the right side (last dimension) with zeros
         pad_amount = target_length - time_dim
         mel = F.pad(mel, (0, pad_amount))
     elif time_dim > target_length:
-        # Trim to the target_length
-        mel = mel[..., :target_length]
+        mel = mel[..., :target_length]  # Trim if too long
     return mel
+
 
 class AudioTransform:
     def __init__(self, subset, snr_target=None):
@@ -120,6 +119,7 @@ class AudioTransform:
                 FunctionalModule(lambda x: x.squeeze(0) if x.dim() == 3 and x.size(0)==1 else x),
                 FunctionalModule(lambda x: self._apply_spec_augment(x)),
                 FunctionalModule(lambda x: pad_or_trim_mel(x, target_length=3000)),
+                FunctionalModule(lambda x: x.transpose(0, 1)),
                 AddNoise(),
                 FunctionalModule(lambda x: torch.nn.functional.layer_norm(x, x.shape, eps=1e-8)),
             )
@@ -129,6 +129,7 @@ class AudioTransform:
                 FunctionalModule(lambda x: self.mel_transform(x)),
                 FunctionalModule(lambda x: x.squeeze(0) if x.dim() == 3 and x.size(0)==1 else x),
                 FunctionalModule(lambda x: pad_or_trim_mel(x, target_length=3000)),
+                FunctionalModule(lambda x: x.transpose(0, 1)),
                 AddNoise(snr_target=snr_target) if snr_target is not None else FunctionalModule(lambda x: x),
                 FunctionalModule(lambda x: torch.nn.functional.layer_norm(x, x.shape, eps=1e-8)),
             )
