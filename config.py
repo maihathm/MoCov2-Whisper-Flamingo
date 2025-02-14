@@ -38,10 +38,10 @@ MODEL_CONFIG = {
     "prob_a": 0.25,        # Probability of using only audio
     
     # Training settings
-    "batch_size": 128,
-    "val_batch_size": 64,
-    "test_batch_size": 64,
-    "num_workers": 0,
+    "batch_size": 8,
+    "val_batch_size": 8,
+    "test_batch_size": 1,
+    "num_workers": 4,
     "max_frames": 400,      # Maximum number of frames per batch
     "max_frames_val": 400,  # Maximum number of frames per batch for validation
     
@@ -59,7 +59,7 @@ TRAIN_CONFIG = {
     "weight_decay": 0.01,
     "gradient_clip_val": 1.0,
     "early_stopping_patience": 10,
-    "accumulate_grad_batches": 1,  # Gradient accumulation steps
+    "accumulate_grad_batches": 2,  # Gradient accumulation steps
     "label_smoothing": 0.1,  # Label smoothing factor
 }
 
@@ -142,6 +142,7 @@ def get_config():
                 "root_dir": DATA_ROOT,
             }),
             "modality": "audiovisual",  
+            "updated_tokenizer_dir":"TW_tokenizer"
         }),
         "model": DotDict({
             "d_model": MODEL_CONFIG["d_model"],

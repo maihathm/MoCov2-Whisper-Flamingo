@@ -7,11 +7,7 @@ from utils.logging_utils import log_tensor_info
 logger = logging.getLogger(__name__)
 
 from .av_dataset import AVDataset
-from .samplers import (
-    ByFrameCountSampler,
-    DistributedSamplerWrapper,
-    RandomSamplerWrapper,
-)
+from .samplers import ByFrameCountSampler, DistributedSamplerWrapper, RandomSamplerWrapper
 from .transforms import AudioTransform, VideoTransform
 
 
@@ -23,72 +19,59 @@ def pad(samples, pad_val=0.0):
     
     collated_batch = samples[0].new_zeros([len(samples), max_size] + sample_shape)
     for i, sample in enumerate(samples):
-        diff = len(sample) - max_size
+        diff = max_size - len(sample)
         if diff == 0:
             collated_batch[i] = sample
         else:
             collated_batch[i] = torch.cat(
-                [sample, sample.new_full([-diff] + sample_shape, pad_val)]
+                [sample, sample.new_full([diff] + sample_shape, pad_val)]
             )
     if len(samples[0].shape) == 1:
         collated_batch = collated_batch.unsqueeze(1)  # targets
-    elif len(samples[0].shape) == 2:
-        pass  # collated_batch: [B, T, 1]
-    elif len(samples[0].shape) == 4:
-        pass  # collated_batch: [B, T, C, H, W]
+    # Với tensor 2D hoặc 4D, giữ nguyên (có thể xử lý sau nếu cần)
     return collated_batch, lengths
 
 
 def collate_pad(batch):
     """
-    Collate function that handles both single modality and audiovisual data
-    with support for gate cross attention
+    Collate function that handles single modality and audiovisual data,
+    including creation of attention masks for gate cross attention.
     """
     batch_out = {}
     
     for data_type in batch[0].keys():
-        # Skip if None
         if all(s[data_type] is None for s in batch):
             continue
-            
-        # Special handling for text targets
+
         if data_type == "target":
             batch_out["targets"] = [s[data_type] for s in batch]
             continue
-            
-        # Handle different padding values based on data type
-        if data_type in ["video_mask", "audio_mask"]:
-            pad_val = 0  # Mask padding
-        else:
-            pad_val = 0.0
-            
-        # Get data and lengths
+
+        pad_val = 0 if data_type in ["video_mask", "audio_mask"] else 0.0
+
         valid_samples = [s[data_type] for s in batch if s[data_type] is not None]
         if valid_samples:
             log_tensor_info(f"First sample of {data_type}", valid_samples[0])
         
         c_batch, sample_lengths = pad(valid_samples, pad_val)
-        
-        # Store in output dictionary
         batch_out[data_type + "s"] = c_batch
         batch_out[data_type + "_lengths"] = torch.tensor(sample_lengths)
         
-        # Log collated batch info
-        log_tensor_info(f"Collated {data_type}s", c_batch)
-        
-        # Add attention mask for gate cross attention if needed
+        # Tạo attention mask
         if data_type in ["video", "audio"]:
             attention_mask = torch.zeros(len(batch), c_batch.size(1), dtype=torch.bool)
             for i, length in enumerate(sample_lengths):
                 attention_mask[i, :length] = True
             batch_out[f"{data_type}_attention_mask"] = attention_mask
-            
+
     return batch_out
 
 
 class DataModule(LightningDataModule):
     """
-    DataModule for handling AVSR data with MOCO v2, Whisper and gate cross attention
+    DataModule cho AVSR sử dụng MOCO v2, Whisper và gate cross attention.
+    - Training: Mỗi sample là 1 cặp video–audio, sử dụng DistributedSampler (nếu đa GPU) hoặc RandomSampler.
+    - Validation: Sử dụng ByFrameCountSampler để giới hạn tổng số frame của mỗi batch.
     """
     def __init__(self, cfg=None):
         super().__init__()
@@ -96,26 +79,27 @@ class DataModule(LightningDataModule):
         self.cfg.gpus = torch.cuda.device_count()
         self.total_gpus = self.cfg.gpus * self.cfg.trainer.num_nodes
         
-        # Set default batch sizes if not specified
+        # Thiết lập batch size nếu chưa có
         self.cfg.data.batch_size = getattr(self.cfg.data, "batch_size", 32)
         self.cfg.data.val_batch_size = getattr(self.cfg.data, "val_batch_size", 32)
         
-        # Set default max frames
+        # Thiết lập số frame tối đa
         self.max_frames = self.cfg.data.get("max_frames", 300)
         self.max_frames_val = self.cfg.data.get("max_frames_val", self.max_frames)
 
-    def _dataloader(self, ds, sampler, collate_fn, num_workers=4, pin_memory=True):
-        """Create a dataloader with given dataset and sampler"""
+    def _dataloader(self, ds, batch_size, sampler, collate_fn, num_workers=4, pin_memory=True):
+        """Tạo DataLoader với dataset, batch_size, sampler và collate_fn cho trước."""
         return torch.utils.data.DataLoader(
             ds,
+            batch_size=batch_size,
+            sampler=sampler,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            batch_sampler=sampler,
             collate_fn=collate_fn,
         )
 
     def train_dataloader(self):
-        """Create training dataloader with proper transforms and sampling"""
+        """Tạo training dataloader với mỗi sample là 1 cặp video–audio."""
         ds_args = self.cfg.data.dataset
         train_ds = AVDataset(
             root_dir=ds_args.root_dir,
@@ -127,25 +111,23 @@ class DataModule(LightningDataModule):
             max_frames=self.max_frames
         )
         
-        # Use frame-based sampling for videos
-        sampler = ByFrameCountSampler(train_ds, self.max_frames, max_frames=self.max_frames)
+        # Sử dụng DistributedSampler nếu chạy trên nhiều GPU, ngược lại RandomSampler
+        if self.total_gpus > 1 and torch.distributed.is_initialized():
+            sampler = torch.utils.data.DistributedSampler(train_ds)
+        else:
+            sampler = torch.utils.data.RandomSampler(train_ds)
         
-        # Handle distributed training
-        # if self.total_gpus > 1 and torch.distributed.is_initialized():
-        #     sampler = DistributedSamplerWrapper(sampler)
-        # else:
-        # sampler = ByFrameCountSampler(sampler)
-            
         return self._dataloader(
-            train_ds,
-            sampler,
-            collate_pad,
+            ds=train_ds,
+            batch_size=self.cfg.data.batch_size,
+            sampler=sampler,
+            collate_fn=collate_pad,
             num_workers=self.cfg.data.get("num_workers", 64),
             pin_memory=True
         )
 
     def val_dataloader(self):
-        """Create validation dataloader"""
+        """Tạo validation dataloader. Ở đây dùng ByFrameCountSampler để gom batch theo tổng số frame."""
         ds_args = self.cfg.data.dataset
         val_ds = AVDataset(
             root_dir=ds_args.root_dir,
@@ -157,10 +139,9 @@ class DataModule(LightningDataModule):
             max_frames=self.max_frames_val
         )
         
-        # Use frame-based sampling without shuffling for validation
         sampler = ByFrameCountSampler(
             val_ds,
-            self.max_frames_val,
+            max_frames_per_gpu=self.max_frames_val,
             shuffle=False,
             max_frames=self.max_frames_val
         )
@@ -172,16 +153,17 @@ class DataModule(LightningDataModule):
                 drop_last=True
             )
             
-        return self._dataloader(
+        # Khi dùng batch_sampler, DataLoader không nhận batch_size
+        return torch.utils.data.DataLoader(
             val_ds,
-            sampler,
-            collate_pad,
+            batch_sampler=sampler,
             num_workers=self.cfg.data.get("num_workers", 0),
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=collate_pad,
         )
 
     def test_dataloader(self):
-        """Create test dataloader with noise target if specified"""
+        """Tạo test dataloader (không sử dụng sampler đặc biệt)."""
         ds_args = self.cfg.data.dataset
         test_ds = AVDataset(
             root_dir=ds_args.root_dir,
@@ -196,7 +178,6 @@ class DataModule(LightningDataModule):
             max_frames=self.max_frames_val
         )
         
-        # For testing, we use a simple dataloader without sampling
         return torch.utils.data.DataLoader(
             test_ds,
             batch_size=self.cfg.data.get("test_batch_size", 1),
