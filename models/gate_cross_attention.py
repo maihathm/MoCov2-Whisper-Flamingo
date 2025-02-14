@@ -1,38 +1,23 @@
-# gate_cross_attention.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
+
+logger = logging.getLogger(__name__)
 
 class LayerNorm(nn.LayerNorm):
-    """Custom LayerNorm that can handle different dtypes"""
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return super().forward(x.float()).type(x.dtype)
 
 class GatedCrossAttentionBlock(nn.Module):
-    """
-    Implements Flamingo's gated cross-attention mechanism following Whisper's implementation style
-    """
-    def __init__(self, d_model, n_heads, dropout=0.1):
+    def __init__(self, d_model, n_heads, dropout=0.1, enable_logging=True):
         super().__init__()
-        
-        # Multi-head attention
-        self.attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Layer normalizations
+        self.enable_logging = enable_logging
+        self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True)
         self.attn_ln = LayerNorm(d_model)
-        self.cross_attn_ln = LayerNorm(d_model)
         self.ff_ln = LayerNorm(d_model)
-        
-        # Gating parameters (following Whisper's implementation)
         self.attn_gate = nn.Parameter(torch.tensor([0.]))
         self.ff_gate = nn.Parameter(torch.tensor([0.]))
-        
-        # Feed-forward network
         n_mlp = d_model * 4
         self.ff = nn.Sequential(
             nn.Linear(d_model, n_mlp),
@@ -40,75 +25,49 @@ class GatedCrossAttentionBlock(nn.Module):
             nn.Linear(n_mlp, d_model),
             nn.Dropout(dropout)
         )
-
     def forward(self, x, xa=None, mask=None):
-        """
-        Forward pass with gated cross-attention and feed-forward layers.
-        Args:
-            x: Main features [B, T, D]
-            xa: Cross-attention features [B, T, D] or [B, 1, T, D]
-            mask: Attention mask [B, T] or [B, 1, T]
-        """
-        # Squeeze extra dimension from xa if needed
+        if self.enable_logging:
+            logger.info(f"GatedCrossAttentionBlock input x shape: {x.shape}")
+            if xa is not None:
+                logger.info(f"Cross attention input xa shape: {xa.shape}")
+            if mask is not None:
+                logger.info(f"Attention mask shape: {mask.shape}")
         if xa is not None and xa.dim() == 4 and xa.size(1) == 1:
-            xa = xa.squeeze(1)  # Now shape [B, T, D]
-        
-        # Also, ensure the mask is 2-D (if it has an extra singleton dimension)
+            xa = xa.squeeze(1)
         if mask is not None and mask.dim() == 3 and mask.size(1) == 1:
-            mask = mask.squeeze(1)  # Now shape [B, T]
-        
-        # Cross attention with gating
+            mask = mask.squeeze(1)
         if xa is not None:
-            x = x + self.attn(
-                self.attn_ln(x),
-                xa,
-                xa,
-                key_padding_mask=mask,
-                need_weights=False
-            )[0] * self.attn_gate.tanh()
-        
-        # Feed-forward with gating
-        x = x + self.ff(self.ff_ln(x)) * self.ff_gate.tanh()
-        
+            attn_out = self.attn(self.attn_ln(x), xa, xa, key_padding_mask=mask, need_weights=False)[0]
+            if self.enable_logging:
+                logger.info(f"Attention output shape: {attn_out.shape}")
+            x = x + attn_out * self.attn_gate.tanh()
+        ff_out = self.ff(self.ff_ln(x))
+        if self.enable_logging:
+            logger.info(f"Feed-forward output shape: {ff_out.shape}")
+        x = x + ff_out * self.ff_gate.tanh()
+        if self.enable_logging:
+            logger.info(f"GatedCrossAttentionBlock output shape: {x.shape}")
         return x
 
-
-
 class GatedCrossModalFusion(nn.Module):
-    """
-    Multi-layer gated cross-modal fusion following Whisper's implementation style
-    """
-    def __init__(self, d_model, n_heads, n_layers, dropout=0.1):
+    def __init__(self, d_model, n_heads, n_layers, dropout=0.1, enable_logging=True):
         super().__init__()
-        
-        # Projection layers
+        self.enable_logging = enable_logging
         self.audio_proj = nn.Linear(d_model, d_model)
         self.video_proj = nn.Linear(d_model, d_model)
-        
-        # Gated cross-attention layers
-        self.layers = nn.ModuleList([
-            GatedCrossAttentionBlock(d_model, n_heads, dropout)
-            for _ in range(n_layers)
-        ])
-        
-        # Final layer norm
+        self.layers = nn.ModuleList([GatedCrossAttentionBlock(d_model, n_heads, dropout, enable_logging=self.enable_logging) for _ in range(n_layers)])
         self.ln_post = LayerNorm(d_model)
-        
     def forward(self, audio_features, video_features, audio_mask=None, video_mask=None):
-        """
-        Multi-layer gated cross-modal fusion
-        Args:
-            audio_features: Audio features from Whisper [B, T_a, D]
-            video_features: Video features from MOCO v2 [B, T_v, D]
-            audio_mask: Audio attention mask [B, T_a]
-            video_mask: Video attention mask [B, T_v]
-        """
-        # Project features
+        if self.enable_logging:
+            logger.info(f"Fusion input audio_features shape: {audio_features.shape}")
+            logger.info(f"Fusion input video_features shape: {video_features.shape}")
         x = self.audio_proj(audio_features)
         xa = self.video_proj(video_features)
-        
-        # Apply gated cross-attention layers
+        if self.enable_logging:
+            logger.info(f"After projection, x shape: {x.shape}, xa shape: {xa.shape}")
         for layer in self.layers:
             x = layer(x, xa, video_mask)
-        
-        return self.ln_post(x)
+        x = self.ln_post(x)
+        if self.enable_logging:
+            logger.info(f"Fusion output shape: {x.shape}")
+        return x

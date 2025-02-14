@@ -1,69 +1,48 @@
-"""
-Configuration file for AVSR model using MOCO v2, Whisper, and Flamingo's gate cross attention
-"""
-
 import os
 import torch
 
-# Data paths
 DATA_ROOT = "/root/maihathm/AVASR/data/avsr_self"
 MOCO_PRETRAINED = "moco_v2_800ep_pretrain.pth.tar"
 
-# Model configuration
 MODEL_CONFIG = {
-    # Frontend configuration
-    "FRONTEND_D_MODEL": 512,    # Frontend model dimension
-    "WORD_NUM_CLASSES": 500,    # Number of word classes
-    "FRAME_LENGTH": 96,         # Frame length for visual frontend
-    "VIDEO_FEATURE_SIZE": 512, # Size of video features
-    
-    # Model dimensions (aligned with Whisper base)
-    "d_model": 512,          # Model dimension
-    "n_heads": 8,           # Number of attention heads
-    "n_layers": 6,          # Number of transformer layers
-    "pe_max_len": 5000,     # Maximum length for positional encoding
-    "fc_hidden_size": 2048, # Hidden size for feed-forward layers
-    "dropout": 0.1,         # Dropout rate
-    
-    # Input processing
-    "required_input_length": 96,  # Required input sequence length
-    "rate_ratio": 640,           # Audio/video sampling rate ratio
-    
-    # Fusion settings
-    "fusion_layers": 8,     # Number of gate cross attention layers
-    "fusion_dropout": 0.1,  # Dropout in fusion layers
-    
-    # Modality dropout
-    "prob_av": 0.5,        # Probability of using both modalities
-    "prob_a": 0.25,        # Probability of using only audio
-    
-    # Training settings
+    "FRONTEND_D_MODEL": 512,
+    "WORD_NUM_CLASSES": 500,
+    "FRAME_LENGTH": 96,
+    "VIDEO_FEATURE_SIZE": 512,
+    "d_model": 512,
+    "n_heads": 8,
+    "n_layers": 6,
+    "pe_max_len": 5000,
+    "fc_hidden_size": 2048,
+    "dropout": 0.1,
+    "required_input_length": 96,
+    "rate_ratio": 640,
+    "fusion_layers": 8,
+    "fusion_dropout": 0.1,
+    "prob_av": 0.5,
+    "prob_a": 0.25,
     "batch_size": 8,
     "val_batch_size": 8,
     "test_batch_size": 1,
     "num_workers": 4,
-    "max_frames": 400,      # Maximum number of frames per batch
-    "max_frames_val": 400,  # Maximum number of frames per batch for validation
-    
-    # Inference settings
-    "beam_width": 3,        # Beam width for beam search
-    "lambda": 0.6,         # CTC/Attention interpolation weight
+    "max_frames": 400,
+    "max_frames_val": 400,
+    "beam_width": 3,
+    "lambda": 0.6,
 }
 
-# Training configuration
 TRAIN_CONFIG = {
     "epochs": 30,
-    "warmup_ratio": 0.1,    # Percentage of total steps for warmup
-    "max_lr": 1e-3,         # Maximum learning rate after warmup
-    "min_lr": 1e-5,         # Minimum learning rate
+    "warmup_ratio": 0.1,
+    "max_lr": 1e-3,
+    "min_lr": 1e-5,
     "weight_decay": 0.01,
     "gradient_clip_val": 1.0,
     "early_stopping_patience": 10,
-    "accumulate_grad_batches": 2,  # Gradient accumulation steps
-    "label_smoothing": 0.1,  # Label smoothing factor
+    "accumulate_grad_batches": 2,
+    "label_smoothing": 0.1,
 }
 
-# Data augmentation settings
 AUGMENTATION = {
     "video": {
         "train": {
@@ -87,21 +66,19 @@ AUGMENTATION = {
     }
 }
 
-# Model settings
 WHISPER_CONFIG = {
     "model_name": "SageLiao/whisper-small-zh-TW",
     "freeze_encoder": True,
-    "use_flash_attention": True,  # Use flash attention if available
+    "use_flash_attention": True,
     "language": "vietnamese",
     "task": "transcribe"
 }
 
 MOCO_CONFIG = {
-    "freeze_encoder": True,  # Freeze MOCO v2 parameters
-    "feature_dim": 512,    # MOCO v2 feature dimension
+    "freeze_encoder": True,
+    "feature_dim": 512,
 }
 
-# Logging and checkpointing
 OUTPUT_CONFIG = {
     "checkpoint_dir": "checkpoints",
     "log_dir": "logs",
@@ -109,24 +86,22 @@ OUTPUT_CONFIG = {
     "monitor": "val_loss",
     "monitor_mode": "min",
     "log_every_n_steps": 100,
-    "save_predictions": True,  # Save model predictions for analysis
+    "save_predictions": True,
     "tensorboard": {
-        "log_graph": True,     # Log model graph
-        "log_weights": True,   # Log weight histograms
-        "log_gates": True      # Log gate attention weights
-    }
+        "log_graph": True,
+        "log_weights": True,
+        "log_gates": True
+    },
+    "enable_logging": True
 }
 
 class DotDict(dict):
-    """Dot notation access to dictionary attributes"""
     def __getattr__(self, attr):
         return self.get(attr)
-    
     def __setattr__(self, key, value):
         self[key] = value
 
 def get_config():
-    """Returns a dictionary containing all configuration settings"""
     config = DotDict({
         "data": DotDict({
             "root_dir": DATA_ROOT,
@@ -141,8 +116,8 @@ def get_config():
             "dataset": DotDict({
                 "root_dir": DATA_ROOT,
             }),
-            "modality": "audiovisual",  
-            "updated_tokenizer_dir":"TW_tokenizer"
+            "modality": "audiovisual",
+            "updated_tokenizer_dir": "TW_tokenizer"
         }),
         "model": DotDict({
             "d_model": MODEL_CONFIG["d_model"],
@@ -164,9 +139,6 @@ def get_config():
             "devices": torch.cuda.device_count() if torch.cuda.is_available() else 1,
         }),
     })
-    
-    # Create output directories if they don't exist
     os.makedirs(config["output"]["checkpoint_dir"], exist_ok=True)
     os.makedirs(config["output"]["log_dir"], exist_ok=True)
-    
     return config

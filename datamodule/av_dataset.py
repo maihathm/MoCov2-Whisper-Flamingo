@@ -1,4 +1,3 @@
-# av_dataset.py
 import os
 import numpy as np
 import torch
@@ -6,29 +5,20 @@ import torchaudio
 import torchvision
 import logging
 from transformers import WhisperProcessor, WhisperFeatureExtractor, WhisperModel
-from utils.logging_utils import log_tensor_info
 
 logger = logging.getLogger(__name__)
 
-
 class DataProcessor:
     def __init__(self):
-        # Khởi tạo mô hình Whisper, processor và feature extractor cho audio
         self.whisper_model = WhisperModel.from_pretrained("SageLiao/whisper-small-zh-TW")
         self.whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-small")
         self.feature_extractor = WhisperFeatureExtractor.from_pretrained("SageLiao/whisper-small-zh-TW")
-        
-        # Freeze các tham số của Whisper
         for param in self.whisper_model.parameters():
             param.requires_grad = False
-            
-        # Các hằng số xử lý
         self.SAMPLE_RATE = 16000
-        self.N_FRAMES = 30  # Số frame cần lấy mỗi giây
-        self.FRAME_RATE = 30  # Tốc độ khung hình của video
-        
+        self.N_FRAMES = 30
+        self.FRAME_RATE = 30
     def cut_or_pad(self, data, size, dim=0):
-        """Cắt hoặc pad dữ liệu theo chiều dim sao cho kích thước = size."""
         current_size = data.size(dim)
         if current_size < size:
             pad_amount = size - current_size
@@ -48,26 +38,15 @@ class DataProcessor:
                 slices = [slice(None)] * data.dim()
                 slices[dim] = slice(0, size)
                 data = data[tuple(slices)]
-        assert data.size(dim) == size, f"Padding/cutting không thành công ở dim {dim}"
+        assert data.size(dim) == size
         return data
-
     def process_audio_whisper(self, waveform):
-        """Tiền xử lý audio sử dụng pipeline của Whisper."""
         if waveform.dtype != torch.float32:
             waveform = waveform.float()
         waveform = waveform / torch.max(torch.abs(waveform))
-        features = self.feature_extractor(
-            waveform.numpy(),
-            sampling_rate=self.SAMPLE_RATE,
-            return_tensors="pt"
-        ).input_features.squeeze(0)
+        features = self.feature_extractor(waveform.numpy(), sampling_rate=self.SAMPLE_RATE, return_tensors="pt").input_features.squeeze(0)
         return features
-
     def load_video(self, path, max_frames=300):
-        """
-        Load và tiền xử lý video cho MOCO v2.
-        Output: tensor với kích thước T x C x H x W.
-        """
         vid = torchvision.io.read_video(path, pts_unit="sec", output_format="THWC")[0]
         vid = vid.permute((0, 3, 1, 2))
         target_frames = int(vid.size(0) * self.FRAME_RATE / self.N_FRAMES)
@@ -77,12 +56,7 @@ class DataProcessor:
         if vid.size(0) > max_frames:
             vid = vid[:max_frames]
         return vid
-
     def load_audio(self, path):
-        """
-        Load và tiền xử lý audio cho Whisper.
-        Output: tensor có kích thước T x n_mels.
-        """
         waveform, sample_rate = torchaudio.load(path[:-4] + ".wav", normalize=True)
         waveform = waveform.squeeze(0)
         if sample_rate != self.SAMPLE_RATE:
@@ -91,32 +65,19 @@ class DataProcessor:
         mel = self.process_audio_whisper(waveform)
         return mel
 
-
 class AVDataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        root_dir,
-        split,  # 'train', 'test', hoặc 'val'
-        modality,
-        audio_transform,
-        video_transform,
-        rate_ratio=640,
-        max_frames=300
-    ):
+    def __init__(self, root_dir, split, modality, audio_transform, video_transform, rate_ratio=640, max_frames=300):
         self.processor = DataProcessor()
         self.root_dir = root_dir
         self.split = split
         self.modality = modality
         self.rate_ratio = rate_ratio
         self.max_frames = max_frames
-
         self.video_dir = os.path.join(root_dir, split, f"{split}_video_seg12s")
         self.text_dir = os.path.join(root_dir, split, f"{split}_text_seg12s")
-        
         self.samples = self._build_dataset()
         self.audio_transform = audio_transform
         self.video_transform = video_transform
-
     def _build_dataset(self):
         samples = []
         for folder in os.listdir(self.text_dir):
@@ -131,40 +92,24 @@ class AVDataset(torch.utils.data.Dataset):
                     if video_file in video_files:
                         with open(os.path.join(text_path, text_file), 'r', encoding='utf-8') as f:
                             text = f.read().strip()
-                        samples.append({
-                            'video_path': os.path.join(video_path, video_file),
-                            'text': text
-                        })
+                        samples.append({'video_path': os.path.join(video_path, video_file), 'text': text})
         return samples
-
     def __getitem__(self, idx):
         sample = self.samples[idx]
         video_path = sample['video_path']
         text = sample['text']
-        
-        return_dict = {
-            "video": None,
-            "audio": None,
-            "video_mask": None,
-            "audio_mask": None,
-            "target": text
-        }
-
+        return_dict = {"video": None, "audio": None, "video_mask": None, "audio_mask": None, "target": text}
         if self.modality in ["video", "audiovisual"]:
             video = self.processor.load_video(video_path, self.max_frames)
             video = self.video_transform(video)
             return_dict["video"] = video
             return_dict["video_mask"] = torch.ones(video.size(0))
-            
         if self.modality in ["audio", "audiovisual"]:
             audio = self.processor.load_audio(video_path)
-            # Ép audio về kích thước 3000 (đầu vào cố định cho Whisper)
             audio = self.processor.cut_or_pad(audio, size=3000, dim=1)
             audio = self.audio_transform(audio)
             return_dict["audio"] = audio
             return_dict["audio_mask"] = torch.ones(audio.size(0))
-
         return return_dict
-
     def __len__(self):
         return len(self.samples)
