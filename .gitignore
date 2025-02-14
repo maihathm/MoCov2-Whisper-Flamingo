@@ -169,3 +169,4 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+moco_v2_800ep_pretrain.pth.tar
