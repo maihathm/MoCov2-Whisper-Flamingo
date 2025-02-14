@@ -1,7 +1,10 @@
 import os
-
+import logging
 import torch
 from pytorch_lightning import LightningDataModule
+from utils.logging_utils import log_tensor_info
+
+logger = logging.getLogger(__name__)
 
 from .av_dataset import AVDataset
 from .samplers import (
@@ -17,6 +20,7 @@ def pad(samples, pad_val=0.0):
     lengths = [len(s) for s in samples]
     max_size = max(lengths)
     sample_shape = list(samples[0].shape[1:])
+    
     collated_batch = samples[0].new_zeros([len(samples), max_size] + sample_shape)
     for i, sample in enumerate(samples):
         diff = len(sample) - max_size
@@ -47,21 +51,30 @@ def collate_pad(batch):
         if all(s[data_type] is None for s in batch):
             continue
             
-        # Handle different padding values based on data type
+        # Special handling for text targets
         if data_type == "target":
-            pad_val = -1
-        elif data_type in ["video_mask", "audio_mask"]:
+            batch_out["targets"] = [s[data_type] for s in batch]
+            continue
+            
+        # Handle different padding values based on data type
+        if data_type in ["video_mask", "audio_mask"]:
             pad_val = 0  # Mask padding
         else:
             pad_val = 0.0
             
         # Get data and lengths
         valid_samples = [s[data_type] for s in batch if s[data_type] is not None]
+        if valid_samples:
+            log_tensor_info(f"First sample of {data_type}", valid_samples[0])
+        
         c_batch, sample_lengths = pad(valid_samples, pad_val)
         
         # Store in output dictionary
         batch_out[data_type + "s"] = c_batch
         batch_out[data_type + "_lengths"] = torch.tensor(sample_lengths)
+        
+        # Log collated batch info
+        log_tensor_info(f"Collated {data_type}s", c_batch)
         
         # Add attention mask for gate cross attention if needed
         if data_type in ["video", "audio"]:
@@ -86,6 +99,10 @@ class DataModule(LightningDataModule):
         # Set default batch sizes if not specified
         self.cfg.data.batch_size = getattr(self.cfg.data, "batch_size", 32)
         self.cfg.data.val_batch_size = getattr(self.cfg.data, "val_batch_size", 32)
+        
+        # Set default max frames
+        self.max_frames = self.cfg.data.get("max_frames", 300)
+        self.max_frames_val = self.cfg.data.get("max_frames_val", self.max_frames)
 
     def _dataloader(self, ds, sampler, collate_fn, num_workers=4, pin_memory=True):
         """Create a dataloader with given dataset and sampler"""
@@ -106,23 +123,24 @@ class DataModule(LightningDataModule):
             modality=self.cfg.data.modality,
             audio_transform=AudioTransform("train"),
             video_transform=VideoTransform("train"),
-            rate_ratio=self.cfg.data.get("rate_ratio", 640)
+            rate_ratio=self.cfg.data.get("rate_ratio", 640),
+            max_frames=self.max_frames
         )
         
         # Use frame-based sampling for videos
-        sampler = ByFrameCountSampler(train_ds, self.cfg.data.max_frames)
+        sampler = ByFrameCountSampler(train_ds, self.max_frames, max_frames=self.max_frames)
         
         # Handle distributed training
-        if self.total_gpus > 1:
-            sampler = DistributedSamplerWrapper(sampler)
-        else:
-            sampler = RandomSamplerWrapper(sampler)
+        # if self.total_gpus > 1 and torch.distributed.is_initialized():
+        #     sampler = DistributedSamplerWrapper(sampler)
+        # else:
+        # sampler = ByFrameCountSampler(sampler)
             
         return self._dataloader(
             train_ds,
             sampler,
             collate_pad,
-            num_workers=self.cfg.data.get("num_workers", 4),
+            num_workers=self.cfg.data.get("num_workers", 64),
             pin_memory=True
         )
 
@@ -131,18 +149,20 @@ class DataModule(LightningDataModule):
         ds_args = self.cfg.data.dataset
         val_ds = AVDataset(
             root_dir=ds_args.root_dir,
-            split="valid",
+            split="val",
             modality=self.cfg.data.modality,
             audio_transform=AudioTransform("val"),
             video_transform=VideoTransform("val"),
-            rate_ratio=self.cfg.data.get("rate_ratio", 640)
+            rate_ratio=self.cfg.data.get("rate_ratio", 640),
+            max_frames=self.max_frames_val
         )
         
         # Use frame-based sampling without shuffling for validation
         sampler = ByFrameCountSampler(
             val_ds,
-            self.cfg.data.max_frames_val,
-            shuffle=False
+            self.max_frames_val,
+            shuffle=False,
+            max_frames=self.max_frames_val
         )
         
         if self.total_gpus > 1:
@@ -156,7 +176,7 @@ class DataModule(LightningDataModule):
             val_ds,
             sampler,
             collate_pad,
-            num_workers=self.cfg.data.get("num_workers", 4),
+            num_workers=self.cfg.data.get("num_workers", 0),
             pin_memory=True
         )
 
@@ -172,7 +192,8 @@ class DataModule(LightningDataModule):
                 snr_target=self.cfg.decode.get("snr_target", None)
             ),
             video_transform=VideoTransform("test"),
-            rate_ratio=self.cfg.data.get("rate_ratio", 640)
+            rate_ratio=self.cfg.data.get("rate_ratio", 640),
+            max_frames=self.max_frames_val
         )
         
         # For testing, we use a simple dataloader without sampling
@@ -180,7 +201,7 @@ class DataModule(LightningDataModule):
             test_ds,
             batch_size=self.cfg.data.get("test_batch_size", 1),
             shuffle=False,
-            num_workers=self.cfg.data.get("num_workers", 4),
+            num_workers=self.cfg.data.get("num_workers", 0),
             collate_fn=collate_pad,
             pin_memory=True
         )

@@ -6,11 +6,14 @@
 
 import os
 import random
-
+import logging
 import sentencepiece
 import torch
 import torchaudio
 import torchvision
+from utils.logging_utils import log_tensor_info
+
+logger = logging.getLogger(__name__)
 
 
 NOISE_FILENAME = os.path.join(
@@ -89,18 +92,20 @@ class AddNoise(torch.nn.Module):
 class VideoTransform:
     """Video transforms for MOCO v2"""
     def __init__(self, subset):
+        self.subset = subset
         # MOCO v2 specific transforms
         if subset == "train":
-            self.video_pipeline = torch.nn.Sequential(
-                FunctionalModule(lambda x: x / 255.0),  # Normalize to [0,1]                torchvision.transforms.RandomHorizontalFlip(),
-                torchvision.transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),  # MOCO v2 color augmentation
-                torchvision.transforms.RandomGrayscale(p=0.2),
-                AdaptiveTimeMask(10, 25),  # Temporal masking
-                torchvision.transforms.Normalize(
+            self.transforms = [
+                ("normalize_0_1", FunctionalModule(lambda x: x / 255.0)),  # Normalize to [0,1]
+                ("random_flip", torchvision.transforms.RandomHorizontalFlip(p=0.5)),  # Add horizontal flip with 50% probability
+                ("color_jitter", torchvision.transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)),  # MOCO v2 color augmentation
+                ("random_gray", torchvision.transforms.RandomGrayscale(p=0.2)),
+                ("time_mask", AdaptiveTimeMask(10, 25)),  # Temporal masking
+                ("normalize_imagenet", torchvision.transforms.Normalize(
                     mean=[0.485, 0.456, 0.406],  # ImageNet normalization used by MOCO v2
                     std=[0.229, 0.224, 0.225]
-                ),
-            )
+                ))
+            ]
         elif subset == "val" or subset == "test":
             self.video_pipeline = torch.nn.Sequential(
                 FunctionalModule(lambda x: x / 255.0),
@@ -111,9 +116,32 @@ class VideoTransform:
             )
 
     def __call__(self, sample):
-        # sample: T x C x H x W
-        # rtype: T x 1 x H x W
-        return self.video_pipeline(sample)
+        """
+        Args:
+            sample: T x C x H x W tensor
+        Returns:
+            T x C x H x W tensor with normalized values
+        """
+        
+        # Ensure input is in correct format
+        if sample.dim() != 4:
+            raise ValueError(f"Expected 4D tensor (T,C,H,W), got shape {sample.shape}")
+        if sample.size(1) != 3:
+            raise ValueError(f"Expected 3 channels, got {sample.size(1)} channels")
+        
+        x = sample
+        if self.subset == "train":
+            for name, transform in self.transforms:
+                x = transform(x)
+        else:
+            # For val/test, just apply normalization
+            x = x / 255.0
+            x = torchvision.transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )(x)
+            
+        return x.contiguous()
 
 
 class AudioTransform:
@@ -143,21 +171,25 @@ class AudioTransform:
         """Apply SpecAugment to mel spectrogram"""
         # Time warping is not used as per Whisper's implementation
         
+        # Ensure mel_spectrogram is 2D (time x frequency)
+        if len(mel_spectrogram.shape) != 2:
+            raise ValueError(f"Expected 2D tensor (time x frequency), got shape {mel_spectrogram.shape}")
+        
         # Frequency masking
         freq_mask_param = 48  # Number of mel frequency channels to mask
         num_freq_masks = 2
         
         for _ in range(num_freq_masks):
-            freq_start = int(torch.randint(0, mel_spectrogram.size(-1) - freq_mask_param, (1,)))
-            mel_spectrogram[..., freq_start:freq_start + freq_mask_param] = 0
+            freq_start = int(torch.randint(0, mel_spectrogram.size(1) - freq_mask_param, (1,)))
+            mel_spectrogram[:, freq_start:freq_start + freq_mask_param] = 0
             
         # Time masking
-        time_mask_param = mel_spectrogram.size(1) // 8  # Max time steps to mask
+        time_mask_param = mel_spectrogram.size(0) // 8  # Max time steps to mask
         num_time_masks = 2
         
         for _ in range(num_time_masks):
-            time_start = int(torch.randint(0, mel_spectrogram.size(1) - time_mask_param, (1,)))
-            mel_spectrogram[:, time_start:time_start + time_mask_param, :] = 0
+            time_start = int(torch.randint(0, mel_spectrogram.size(0) - time_mask_param, (1,)))
+            mel_spectrogram[time_start:time_start + time_mask_param, :] = 0
             
         return mel_spectrogram
 

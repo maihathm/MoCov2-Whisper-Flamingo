@@ -3,6 +3,7 @@ from typing import Iterator, Optional
 
 import numpy as np
 import torch
+import torchvision
 
 from fairseq.data import data_utils
 from torch.utils.data import Dataset, DistributedSampler, RandomSampler
@@ -10,10 +11,19 @@ from torch.utils.data.sampler import Sampler
 
 
 class ByFrameCountSampler(Sampler):
-    def __init__(self, dataset, max_frames_per_gpu, shuffle=True, seed=0):
+    def __init__(self, dataset, max_frames_per_gpu, shuffle=True, seed=0, max_frames=300):
         self.dataset = dataset
         self.max_frames_per_gpu = max_frames_per_gpu
-        self.sizes = [item[2] for item in self.dataset.list]
+        self.max_frames = max_frames
+        # Get video lengths from dataset samples
+        self.sizes = []
+        for idx in range(len(dataset)):
+            # Load video path
+            video_path = dataset.samples[idx]['video_path']
+            # Get video info without loading the full video
+            video_info = torchvision.io.read_video_timestamps(video_path, pts_unit='sec')
+            # Store number of frames, capped at max_frames
+            self.sizes.append(min(len(video_info[0]), self.max_frames))
 
         self.shuffle = shuffle
         self.seed = seed

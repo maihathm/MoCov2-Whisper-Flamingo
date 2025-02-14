@@ -1,0 +1,62 @@
+data_root_dir: /root/maihathm/AVASR/data/avsr_self
+data_moco_file: moco_v2_800ep_pretrain.pth.tar
+data_batch_size: 32
+data_val_batch_size: 32
+data_test_batch_size: 1
+data_num_workers: 0
+data_max_frames: 400
+data_max_frames_val: 400
+data_rate_ratio: 640
+data_modality: audiovisual
+model_d_model: 512
+model_n_heads: 8
+model_n_layers: 6
+model_pe_max_len: 5000
+model_fc_hidden_size: 2048
+model_dropout: 0.1
+model_fusion_layers: 3
+model_required_input_length: 96
+training_epochs: 100
+training_warmup_ratio: 0.1
+training_max_lr: 0.001
+training_min_lr: 1.0e-05
+training_weight_decay: 0.01
+training_gradient_clip_val: 1.0
+training_early_stopping_patience: 10
+training_accumulate_grad_batches: 2
+training_label_smoothing: 0.1
+augmentation_video:
+  train:
+    random_crop: 224
+    color_jitter: 0.4
+    grayscale_prob: 0.2
+    time_mask_window: 10
+    time_mask_stride: 25
+  val:
+    center_crop: 224
+augmentation_audio:
+  train:
+    freq_mask_param: 48
+    time_mask_param: length//8
+    n_freq_masks: 2
+    n_time_masks: 2
+whisper_model_name: SageLiao/whisper-small-zh-TW
+whisper_freeze_encoder: true
+whisper_use_flash_attention: true
+whisper_language: vietnamese
+whisper_task: transcribe
+output_checkpoint_dir: checkpoints
+output_log_dir: logs
+output_save_top_k: 3
+output_monitor: val_loss
+output_monitor_mode: min
+output_log_every_n_steps: 100
+output_save_predictions: true
+output_tensorboard:
+  log_graph: true
+  log_weights: true
+  log_gates: true
+trainer_num_nodes: 1
+trainer_accelerator: gpu
+trainer_devices: 1
+gpus: 1

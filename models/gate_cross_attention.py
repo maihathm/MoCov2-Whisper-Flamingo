@@ -43,12 +43,20 @@ class GatedCrossAttentionBlock(nn.Module):
 
     def forward(self, x, xa=None, mask=None):
         """
-        Forward pass with gated cross-attention and feed-forward layers
+        Forward pass with gated cross-attention and feed-forward layers.
         Args:
             x: Main features [B, T, D]
-            xa: Cross-attention features [B, T, D]
-            mask: Attention mask [B, T]
+            xa: Cross-attention features [B, T, D] or [B, 1, T, D]
+            mask: Attention mask [B, T] or [B, 1, T]
         """
+        # Squeeze extra dimension from xa if needed
+        if xa is not None and xa.dim() == 4 and xa.size(1) == 1:
+            xa = xa.squeeze(1)  # Now shape [B, T, D]
+        
+        # Also, ensure the mask is 2-D (if it has an extra singleton dimension)
+        if mask is not None and mask.dim() == 3 and mask.size(1) == 1:
+            mask = mask.squeeze(1)  # Now shape [B, T]
+        
         # Cross attention with gating
         if xa is not None:
             x = x + self.attn(
@@ -63,6 +71,7 @@ class GatedCrossAttentionBlock(nn.Module):
         x = x + self.ff(self.ff_ln(x)) * self.ff_gate.tanh()
         
         return x
+
 
 
 class GatedCrossModalFusion(nn.Module):

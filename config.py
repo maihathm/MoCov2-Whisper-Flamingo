@@ -3,6 +3,7 @@ Configuration file for AVSR model using MOCO v2, Whisper, and Flamingo's gate cr
 """
 
 import os
+import torch
 
 # Data paths
 DATA_ROOT = "/root/maihathm/AVASR/data/avsr_self"
@@ -11,10 +12,10 @@ MOCO_PRETRAINED = "moco_v2_800ep_pretrain.pth.tar"
 # Model configuration
 MODEL_CONFIG = {
     # Frontend configuration
-    "FRONTEND_DMODEL": 512,    # Frontend model dimension
-    "WORD_NUM_CLASSES": 500,   # Number of word classes
-    "FRAME_LENGTH": 96,        # Frame length for visual frontend
-    "VIDEO_FEATURE_SIZE": 2048, # Size of video features
+    "FRONTEND_D_MODEL": 512,    # Frontend model dimension
+    "WORD_NUM_CLASSES": 500,    # Number of word classes
+    "FRAME_LENGTH": 96,         # Frame length for visual frontend
+    "VIDEO_FEATURE_SIZE": 512, # Size of video features
     
     # Model dimensions (aligned with Whisper base)
     "d_model": 512,          # Model dimension
@@ -29,7 +30,7 @@ MODEL_CONFIG = {
     "rate_ratio": 640,           # Audio/video sampling rate ratio
     
     # Fusion settings
-    "fusion_layers": 3,     # Number of gate cross attention layers
+    "fusion_layers": 8,     # Number of gate cross attention layers
     "fusion_dropout": 0.1,  # Dropout in fusion layers
     
     # Modality dropout
@@ -37,28 +38,28 @@ MODEL_CONFIG = {
     "prob_a": 0.25,        # Probability of using only audio
     
     # Training settings
-    "batch_size": 32,
-    "val_batch_size": 32,
-    "test_batch_size": 1,
-    "num_workers": 4,
-    "max_frames": 300,      # Maximum number of frames per batch
+    "batch_size": 128,
+    "val_batch_size": 64,
+    "test_batch_size": 64,
+    "num_workers": 0,
+    "max_frames": 400,      # Maximum number of frames per batch
     "max_frames_val": 400,  # Maximum number of frames per batch for validation
     
     # Inference settings
-    "beam_width": 5,        # Beam width for beam search
+    "beam_width": 3,        # Beam width for beam search
     "lambda": 0.6,         # CTC/Attention interpolation weight
 }
 
 # Training configuration
 TRAIN_CONFIG = {
-    "epochs": 100,
+    "epochs": 30,
     "warmup_ratio": 0.1,    # Percentage of total steps for warmup
     "max_lr": 1e-3,         # Maximum learning rate after warmup
     "min_lr": 1e-5,         # Minimum learning rate
     "weight_decay": 0.01,
     "gradient_clip_val": 1.0,
     "early_stopping_patience": 10,
-    "accumulate_grad_batches": 2,  # Gradient accumulation steps
+    "accumulate_grad_batches": 1,  # Gradient accumulation steps
     "label_smoothing": 0.1,  # Label smoothing factor
 }
 
@@ -88,14 +89,16 @@ AUGMENTATION = {
 
 # Model settings
 WHISPER_CONFIG = {
-    "model_name": "openai/whisper-base",
+    "model_name": "SageLiao/whisper-small-zh-TW",
     "freeze_encoder": True,
     "use_flash_attention": True,  # Use flash attention if available
+    "language": "vietnamese",
+    "task": "transcribe"
 }
 
 MOCO_CONFIG = {
     "freeze_encoder": True,  # Freeze MOCO v2 parameters
-    "feature_dim": 2048,    # MOCO v2 feature dimension
+    "feature_dim": 512,    # MOCO v2 feature dimension
 }
 
 # Logging and checkpointing
@@ -114,10 +117,18 @@ OUTPUT_CONFIG = {
     }
 }
 
+class DotDict(dict):
+    """Dot notation access to dictionary attributes"""
+    def __getattr__(self, attr):
+        return self.get(attr)
+    
+    def __setattr__(self, key, value):
+        self[key] = value
+
 def get_config():
     """Returns a dictionary containing all configuration settings"""
-    config = {
-        "data": {
+    config = DotDict({
+        "data": DotDict({
             "root_dir": DATA_ROOT,
             "moco_file": MOCO_PRETRAINED,
             "batch_size": MODEL_CONFIG["batch_size"],
@@ -127,8 +138,12 @@ def get_config():
             "max_frames": MODEL_CONFIG["max_frames"],
             "max_frames_val": MODEL_CONFIG["max_frames_val"],
             "rate_ratio": MODEL_CONFIG["rate_ratio"],
-        },
-        "model": {
+            "dataset": DotDict({
+                "root_dir": DATA_ROOT,
+            }),
+            "modality": "audiovisual",  
+        }),
+        "model": DotDict({
             "d_model": MODEL_CONFIG["d_model"],
             "n_heads": MODEL_CONFIG["n_heads"],
             "n_layers": MODEL_CONFIG["n_layers"],
@@ -137,12 +152,17 @@ def get_config():
             "dropout": MODEL_CONFIG["dropout"],
             "fusion_layers": MODEL_CONFIG["fusion_layers"],
             "required_input_length": MODEL_CONFIG["required_input_length"],
-        },
-        "training": TRAIN_CONFIG,
-        "augmentation": AUGMENTATION,
-        "whisper": WHISPER_CONFIG,
-        "output": OUTPUT_CONFIG,
-    }
+        }),
+        "training": DotDict(TRAIN_CONFIG),
+        "augmentation": DotDict(AUGMENTATION),
+        "whisper": DotDict(WHISPER_CONFIG),
+        "output": DotDict(OUTPUT_CONFIG),
+        "trainer": DotDict({
+            "num_nodes": 1,
+            "accelerator": "gpu" if torch.cuda.is_available() else "cpu",
+            "devices": torch.cuda.device_count() if torch.cuda.is_available() else 1,
+        }),
+    })
     
     # Create output directories if they don't exist
     os.makedirs(config["output"]["checkpoint_dir"], exist_ok=True)

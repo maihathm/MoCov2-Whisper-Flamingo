@@ -1,19 +1,46 @@
 import os
+import copy
 import torch
+import torch.nn as nn
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
-
+import torch.nn.functional as F
+import logging
 from config import get_config
 from datamodule.data_module import DataModule
 from models.av_net import AVNet
+from utils.logging_utils import setup_logging, log_tensor_info
+from pytorch_lightning.strategies import DDPStrategy
+# Setup logging
+setup_logging(level=logging.WARNING)
+logger = logging.getLogger(__name__)
+
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '7'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '2,3,6'
+def is_deepcopyable(obj):
+    try:
+        copy.deepcopy(obj)
+        return True
+    except Exception:
+        return False
 
 
 class AVSRModule(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
-        self.save_hyperparameters()
         self.config = config
+        hparams = {}
+        for section, params in config.items():
+            if isinstance(params, dict):
+                for key, value in params.items():
+                    if is_deepcopyable(value):
+                        hparams[f"{section}_{key}"] = value
+            else:
+                if is_deepcopyable(params):
+                    hparams[section] = params
+        self.save_hyperparameters(hparams)
         
         # Model initialization
         model_args = (
@@ -22,8 +49,7 @@ class AVSRModule(pl.LightningModule):
             config["model"]["n_layers"],
             config["model"]["pe_max_len"],
             config["model"]["fc_hidden_size"],
-            config["model"]["dropout"],
-            config["model"]["num_classes"]
+            config["model"]["dropout"]
         )
         
         self.model = AVNet(
@@ -33,53 +59,28 @@ class AVSRModule(pl.LightningModule):
             modelargs=model_args
         )
         
-        # Loss functions with label smoothing
-        self.loss_fn = nn.CrossEntropyLoss(
-            ignore_index=-100,
-            label_smoothing=0.1
-        )
-        
-        # Modality dropout probabilities
-        self.prob_av = 0.5  # Probability of using both modalities
-        self.prob_a = 0.25  # Probability of using only audio
-        # Remaining 0.25 probability is for using only video
-        
-    def _apply_modality_dropout(self, audio_features, video_features):
-        """Apply modality dropout during training"""
-        if self.training:
-            rand_val = torch.rand(1).item()
-            if rand_val <= self.prob_av:
-                return audio_features, video_features  # Use both
-            elif rand_val <= self.prob_av + self.prob_a:
-                return audio_features, None  # Use only audio
-            else:
-                return None, video_features  # Use only video
-        return audio_features, video_features
+        # MSE Loss for feature learning
+        self.loss_fn = nn.MSELoss()
         
     def training_step(self, batch, batch_idx):
+        logger.debug(f"\n{'='*50}\nStarting training step {batch_idx}\n{'='*50}")
+        
+        
         # Prepare input data
         input_data = (
-            batch["audio"],
-            batch["audio_mask"],
-            batch["video"],
-            batch["video_lengths"]
+            batch["audios"],
+            batch["audio_attention_mask"],
+            batch["videos"],
+            batch["video_attention_mask"]
         )
         
-        # Forward pass with modality dropout
-        logits = self.model(
-            input_data,
-            batch["targets"],
-            batch["target_lengths"]
-        )
+        features = self.model(input_data)
         
-        # Calculate loss
-        B, T, V = logits.shape
-        loss = self.loss_fn(
-            logits.view(-1, V),
-            batch["targets"].view(-1)
-        )
+        # Calculate MSE loss between audio and video features
+        features, target_audio = self.model(input_data, return_audio=True)
+        loss = self.loss_fn(features, target_audio)
         
-        # Log metrics
+        # Log training loss
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         
         # Log gate attention weights
@@ -91,37 +92,30 @@ class AVSRModule(pl.LightningModule):
         return loss
         
     def validation_step(self, batch, batch_idx):
-        # Forward pass without modality dropout
+        logger.debug(f"\n{'='*50}\nStarting validation step {batch_idx}\n{'='*50}")
+        
+        # Chuẩn bị dữ liệu
         input_data = (
-            batch["audio"],
-            batch["audio_mask"],
-            batch["video"],
-            batch["video_lengths"]
+            batch["audios"],
+            batch["audio_attention_mask"],
+            batch["videos"],
+            batch["video_attention_mask"]
         )
         
-        logits = self.model(
-            input_data,
-            batch["targets"],
-            batch["target_lengths"]
-        )
+        # Lấy cả kết quả của fusion module và audio embedding đã được xử lý
+        features, target_audio = self.model(input_data, return_audio=True)
         
-        # Calculate loss
-        B, T, V = logits.shape
-        loss = self.loss_fn(
-            logits.view(-1, V),
-            batch["targets"].view(-1)
-        )
-        
-        # Log metrics
+        # Tính loss giữa các embedding (đều có shape [B, T, dModel])
+        loss = self.loss_fn(features, target_audio)
         self.log('val_loss', loss, on_epoch=True, prog_bar=True)
         
-        # Calculate accuracy
-        predictions = logits.argmax(dim=-1)
-        correct = (predictions == batch["targets"]).masked_fill(batch["targets"] == -100, 0)
-        accuracy = correct.sum() / (batch["targets"] != -100).sum()
-        self.log('val_accuracy', accuracy, on_epoch=True, prog_bar=True)
+        # Tính cosine similarity (nếu cần)
+        cos_sim = F.cosine_similarity(features.mean(1), target_audio.mean(1))
+        self.log('val_cosine_sim', cos_sim.mean(), on_epoch=True, prog_bar=True)
         
         return loss
+
+
         
     def configure_optimizers(self):
         # Separate parameters for weight decay
@@ -141,7 +135,7 @@ class AVSRModule(pl.LightningModule):
         # Create optimizer
         optimizer = torch.optim.AdamW(
             optimizer_grouped_parameters,
-            lr=0.0,  # Will be set by scheduler
+            lr=0.0,  # Will be set by the scheduler
             betas=(0.9, 0.98),
             eps=1e-6
         )
@@ -175,16 +169,31 @@ class AVSRModule(pl.LightningModule):
         }
 
 
+
+class DebugCallback(pl.Callback):
+    def on_validation_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx=0):
+        logger.debug(f"\n{'='*50}\nStarting validation batch {batch_idx}\n{'='*50}")
+        
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        logger.debug(f"Completed validation batch {batch_idx}")
+        if batch_idx == 0:  # Log detailed info for first batch only
+            logger.debug("First batch validation results:")
+            log_tensor_info("Model outputs", outputs)
+
 def main():
+    logger = logging.getLogger(__name__)
+    
     # Load configuration
     config = get_config()
-    
+
+
     # Initialize data module and model
     data_module = DataModule(config)
     model = AVSRModule(config)
-    
-    # Setup callbacks
+
+    # Setup callbacks with debug callback
     callbacks = [
+        DebugCallback(),
         # Model checkpointing
         ModelCheckpoint(
             dirpath=config["output"]["checkpoint_dir"],
@@ -202,32 +211,32 @@ def main():
         # Learning rate monitor
         pl.callbacks.LearningRateMonitor(logging_interval='step')
     ]
-    
-    # Setup logger with more detailed metrics
-    logger = TensorBoardLogger(
+    # Setup logger with detailed metrics
+    tb_logger = TensorBoardLogger(
         save_dir=config["output"]["log_dir"],
         name='avsr_logs',
         default_hp_metric=False
     )
-    
-    # Initialize trainer with improved settings
+    # Initialize trainer with improved settings and logging
     trainer = pl.Trainer(
         max_epochs=config["training"]["epochs"],
         callbacks=callbacks,
-        logger=logger,
+        logger=tb_logger,  # Use the TensorBoard logger here
         gradient_clip_val=config["training"]["gradient_clip_val"],
         accumulate_grad_batches=config["training"].get("accumulate_grad_batches", 1),
-        precision=16,  # Use mixed precision training
+        precision="16-mixed", 
         accelerator='auto',
-        devices='auto',
-        strategy='ddp' if torch.cuda.device_count() > 1 else None,
-        deterministic=True,
-        benchmark=True
+        devices="auto",
+        strategy=DDPStrategy(find_unused_parameters=True),
+        benchmark=True,
+        # sync_batchnorm=True,
+        # use_distributed_sampler=False,
+        # replace_sampler_ddp=False,
+        enable_progress_bar=True,  # Enable progress bar for better monitoring
     )
     
-    # Train model
     trainer.fit(model, data_module)
 
-
 if __name__ == "__main__":
+    logger = logging.getLogger(__name__)
     main()
