@@ -10,7 +10,7 @@ from transformers import WhisperProcessor, WhisperFeatureExtractor, WhisperModel
 logger = logging.getLogger(__name__)
 
 class DataProcessor:
-    def __init__(self, tokenizer_name="SageLiao/whisper-small-zh-TW"):
+    def __init__(self, tokenizer_name="openai/whisper-small"):
         logger.info(f"Initializing DataProcessor with tokenizer: {tokenizer_name}")
         
         # Initialize Whisper components
@@ -55,7 +55,16 @@ class DataProcessor:
         if waveform.dtype != torch.float32:
             waveform = waveform.float()
         waveform = waveform / torch.max(torch.abs(waveform))
-        features = self.feature_extractor(waveform.numpy(), sampling_rate=self.SAMPLE_RATE, return_tensors="pt").input_features.squeeze(0)
+        waveform_np = waveform.numpy()
+        if waveform_np.ndim == 1:
+            waveform_np = waveform_np[None, :]
+        features = self.feature_extractor(
+            waveform_np,
+            sampling_rate=self.SAMPLE_RATE,
+            return_tensors="pt"
+        ).input_features
+        if features.dim() == 3:
+            features = features.squeeze(0)
         return features
     def load_video(self, path, max_frames=300):
         vid = torchvision.io.read_video(path, pts_unit="sec", output_format="THWC")[0]
@@ -77,7 +86,7 @@ class DataProcessor:
         return mel
 
 class AVDataset(torch.utils.data.Dataset):
-    def __init__(self, root_dir, split, modality, audio_transform, video_transform, rate_ratio=640, max_frames=300, tokenizer_name="SageLiao/whisper-small-zh-TW"):
+    def __init__(self, root_dir, split, modality, audio_transform, video_transform, rate_ratio=640, max_frames=300, tokenizer_name="openai/whisper-small"):
         logger.info(f"Initializing AVDataset for split: {split}")
         self.processor = DataProcessor(tokenizer_name)
         self.root_dir = root_dir
@@ -106,51 +115,93 @@ class AVDataset(torch.utils.data.Dataset):
                             text = f.read().strip()
                         samples.append({'video_path': os.path.join(video_path, video_file), 'text': text})
         return samples
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        video_path = sample['video_path']
-        text = sample['text']
-        
-        # Process text target
-        encoded = self.processor.tokenizer(
-            text,
-            padding=True,
-            truncation=True,
-            max_length=448,  # Whisper's max sequence length
-            return_tensors="pt"
-        )
-        target_ids = encoded.input_ids.squeeze(0)
-        target_length = torch.tensor([len(target_ids)])
-        
-        return_dict = {
-            "video": None,
-            "video_mask": None,
-            "audio": None, 
-            "audio_mask": None,
-            "target_ids": target_ids,
-            "target_text": text,
-            "target_lengths": target_length
+    def _get_empty_sample(self):
+        """Return an empty sample with correct shapes when loading fails"""
+        return {
+            "video": torch.zeros(self.max_frames, 3, 96, 96),
+            "video_mask": torch.zeros(self.max_frames, dtype=torch.bool),
+            "video_lengths": torch.tensor([0]),
+            "audio": torch.zeros(3000, 80),
+            "audio_mask": torch.zeros(3000, dtype=torch.bool),
+            "audio_lengths": torch.tensor([0]),
+            "target_ids": torch.zeros(1, dtype=torch.long),
+            "target_text": "",
+            "target_lengths": torch.tensor([1])
         }
-        
-        # Load and process video if needed
-        if self.modality in ["video", "audiovisual"]:
-            video = self.processor.load_video(video_path, self.max_frames)
-            video = self.video_transform(video)
-            video_mask = torch.ones(video.size(0), dtype=torch.bool)
-            return_dict["video"] = video
-            return_dict["video_mask"] = video_mask
-            return_dict["video_lengths"] = torch.tensor([video.size(0)])
-        
-        # Load and process audio if needed
-        if self.modality in ["audio", "audiovisual"]:
-            audio = self.processor.load_audio(video_path)
-            audio = self.processor.cut_or_pad(audio, size=3000, dim=1)
-            audio = self.audio_transform(audio)
-            audio_mask = torch.ones(audio.size(0), dtype=torch.bool)
-            return_dict["audio"] = audio
-            return_dict["audio_mask"] = audio_mask
-            return_dict["audio_lengths"] = torch.tensor([audio.size(0)])
-        
-        return return_dict
+    def __getitem__(self, idx):
+        try:
+            sample = self.samples[idx]
+            video_path = sample['video_path']
+            text = sample['text']
+            
+            # Process text target
+            encoded = self.processor.tokenizer(
+                text,
+                padding=True,
+                truncation=True,
+                max_length=448,  # Whisper's max sequence length
+                return_tensors="pt"
+            )
+            target_ids = encoded.input_ids.squeeze(0)
+            target_length = torch.tensor([len(target_ids)])
+            
+            return_dict = {
+                "video": None,
+                "video_mask": None,
+                "audio": None, 
+                "audio_mask": None,
+                "target_ids": target_ids,
+                "target_text": text,
+                "target_lengths": target_length
+            }
+            
+            # Load and process video if needed
+            if self.modality in ["video", "audiovisual"]:
+                video = self.processor.load_video(video_path, self.max_frames)
+                video = self.video_transform(video)
+                
+                # Pad or trim video to max_frames
+                current_frames = video.size(0)
+                if current_frames > self.max_frames:
+                    video = video[:self.max_frames]
+                elif current_frames < self.max_frames:
+                    padding = torch.zeros(self.max_frames - current_frames, *video.shape[1:])
+                    video = torch.cat([video, padding], dim=0)
+                
+                # Create proper mask for actual frames
+                video_mask = torch.zeros(self.max_frames, dtype=torch.bool)
+                video_mask[:min(current_frames, self.max_frames)] = True
+                
+                return_dict["video"] = video
+                return_dict["video_mask"] = video_mask
+                return_dict["video_lengths"] = torch.tensor([min(current_frames, self.max_frames)])
+                
+            if self.modality in ["audio", "audiovisual"]:
+                audio = self.processor.load_audio(video_path)
+                audio = self.processor.cut_or_pad(audio, size=3000, dim=1)
+                audio = self.audio_transform(audio)
+                
+                # Ensure consistent audio length
+                audio_length = audio.size(0)
+                target_length = 3000  # Or whatever your target length is
+                
+                if audio_length > target_length:
+                    audio = audio[:target_length]
+                elif audio_length < target_length:
+                    padding = torch.zeros(target_length - audio_length, *audio.shape[1:])
+                    audio = torch.cat([audio, padding], dim=0)
+                
+                # Create proper mask for actual audio frames
+                audio_mask = torch.zeros(target_length, dtype=torch.bool)
+                audio_mask[:min(audio_length, target_length)] = True
+                
+                return_dict["audio"] = audio
+                return_dict["audio_mask"] = audio_mask
+                return_dict["audio_lengths"] = torch.tensor([min(audio_length, target_length)])
+            
+            return return_dict
+        except Exception as e:
+            logger.error(f"Error processing sample {idx}: {str(e)}")
+            return self._get_empty_sample()
     def __len__(self):
         return len(self.samples)

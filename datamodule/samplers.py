@@ -16,21 +16,25 @@ class ByFrameCountSampler(Sampler):
         self.dataset = dataset
         self.max_frames_per_gpu = max_frames_per_gpu
         self.max_frames = max_frames
-        # Lấy độ dài video từ các sample của dataset
         self.sizes = []
+        
         for idx in range(len(dataset)):
-            video_path = dataset.samples[idx]['video_path']
-            # Lấy thông tin video (không cần load toàn bộ video)
-            video_info = torchvision.io.read_video_timestamps(video_path, pts_unit='sec')
-            # Giới hạn số frame tối đa là max_frames
-            self.sizes.append(min(len(video_info[0]), self.max_frames))
-
+            try:
+                video_path = dataset.samples[idx]['video_path']
+                video_info = torchvision.io.read_video_timestamps(video_path, pts_unit='sec')
+                self.sizes.append(min(len(video_info[0]), self.max_frames))
+            except Exception as e:
+                logger.warning(f"Error reading video {video_path}: {str(e)}")
+                # Fallback to max_frames if we can't read the video
+                self.sizes.append(self.max_frames)
+                
         self.shuffle = shuffle
         self.seed = seed
         self.epoch = 0
-
         batch_indices = data_utils.batch_by_size(
-            self._get_indices(), lambda i: self.sizes[i], max_tokens=max_frames_per_gpu
+            self._get_indices(), 
+            lambda i: self.sizes[i], 
+            max_tokens=max_frames_per_gpu
         )
         self.num_batches = len(batch_indices)
 

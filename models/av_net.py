@@ -21,8 +21,7 @@ class AVNet(nn.Module):
         self.modal_switch = torch.tensor([[1., 1., 1.],
                                             [0., 1., 0.],
                                             [0., 0., 1.]])
-        self.register_buffer("modal_switch", self.modal_switch)
-        self.whisper_model = WhisperModel.from_pretrained("SageLiao/whisper-small-zh-TW")
+        self.whisper_model = WhisperModel.from_pretrained("openai/whisper-small")
         for param in self.whisper_model.parameters():
             param.requires_grad = False
         for layer in self.whisper_model.encoder.layers[-4:]:

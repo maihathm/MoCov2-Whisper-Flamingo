@@ -10,7 +10,7 @@ from torch.utils.data import Dataset, DistributedSampler, RandomSampler, DataLoa
 from torch.utils.data.sampler import Sampler
 from .av_dataset import AVDataset
 from .transforms import AudioTransform, VideoTransform
-
+from operator import itemgetter
 logger = logging.getLogger(__name__)
 
 class ByFrameCountSampler(Sampler):
@@ -93,7 +93,32 @@ class RandomSamplerWrapper(RandomSampler):
         indexes_of_indexes = super().__iter__()
         subsampler_indexes = self.dataset
         return iter(itemgetter(*indexes_of_indexes)(subsampler_indexes))
-
+def collate_fn(batch):
+    # Get max length for target_ids in this batch
+    max_target_len = max(item['target_ids'].size(0) for item in batch)
+    
+    # Pad all target_ids to max_target_len
+    padded_targets = []
+    for item in batch:
+        curr_len = item['target_ids'].size(0)
+        if curr_len < max_target_len:
+            padding = torch.zeros(max_target_len - curr_len, dtype=item['target_ids'].dtype)
+            padded_target = torch.cat([item['target_ids'], padding])
+        else:
+            padded_target = item['target_ids']
+        padded_targets.append(padded_target)
+    
+    return {
+        'video': torch.stack([item['video'] for item in batch]),
+        'video_mask': torch.stack([item['video_mask'] for item in batch]),
+        'audio': torch.stack([item['audio'] for item in batch]) if batch[0]['audio'] is not None else None,
+        'audio_mask': torch.stack([item['audio_mask'] for item in batch]) if batch[0]['audio_mask'] is not None else None,
+        'target_ids': torch.stack(padded_targets),
+        'target_text': [item['target_text'] for item in batch],
+        'target_lengths': torch.stack([item['target_lengths'] for item in batch]),
+        'audio_lengths': torch.stack([item['audio_lengths'] for item in batch]) if batch[0]['audio_lengths'] is not None else None,
+        'video_lengths': torch.stack([item['video_lengths'] for item in batch])
+    }
 class DataModule(pl.LightningDataModule):
     def __init__(self, config):
         super().__init__()
@@ -185,7 +210,8 @@ class DataModule(pl.LightningDataModule):
             self.train_dataset,
             batch_sampler=sampler,
             num_workers=self.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=collate_fn
         )
 
     def val_dataloader(self):
@@ -195,7 +221,8 @@ class DataModule(pl.LightningDataModule):
             self.val_dataset,
             batch_sampler=sampler,
             num_workers=self.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=collate_fn
         )
 
     def test_dataloader(self):
@@ -205,5 +232,6 @@ class DataModule(pl.LightningDataModule):
             self.test_dataset,
             batch_sampler=sampler,
             num_workers=self.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=collate_fn
         )

@@ -11,7 +11,11 @@ from utils.logging_utils import log_tensor_info
 NOISE_FILENAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "babble_noise.wav")
 SP_MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "spm", "unigram", "unigram3370.model")
 DICT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "spm", "unigram", "unigram3370_units.txt")
-
+def to_mono(x):
+    # If x has more than one channel, average across channels.
+    if x.dim() == 2 and x.size(0) > 1:
+        return x.mean(dim=0, keepdim=True)
+    return x
 class FunctionalModule(torch.nn.Module):
     def __init__(self, functional):
         super().__init__()
@@ -83,21 +87,54 @@ class VideoTransform:
             x = x / 255.0
             x = torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(x)
         return x.contiguous()
+import torch.nn.functional as F
+
+def pad_or_trim_mel(mel, target_length=3000):
+    """
+    Pads (or trims) the mel spectrogram along the time dimension to target_length.
+    Assumes mel shape is [batch, n_mels, time].
+    """
+    time_dim = mel.size(-1)
+    if time_dim < target_length:
+        # Pad on the right side (last dimension) with zeros
+        pad_amount = target_length - time_dim
+        mel = F.pad(mel, (0, pad_amount))
+    elif time_dim > target_length:
+        # Trim to the target_length
+        mel = mel[..., :target_length]
+    return mel
 
 class AudioTransform:
     def __init__(self, subset, snr_target=None):
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=16000,
+            n_fft=400,
+            win_length=400,
+            hop_length=160,
+            n_mels=80,
+        )
         if subset == "train":
             self.audio_pipeline = torch.nn.Sequential(
+                FunctionalModule(lambda x: to_mono(x)),
+                FunctionalModule(lambda x: self.mel_transform(x)),
+                FunctionalModule(lambda x: x.squeeze(0) if x.dim() == 3 and x.size(0)==1 else x),
                 FunctionalModule(lambda x: self._apply_spec_augment(x)),
+                FunctionalModule(lambda x: pad_or_trim_mel(x, target_length=3000)),
                 AddNoise(),
                 FunctionalModule(lambda x: torch.nn.functional.layer_norm(x, x.shape, eps=1e-8)),
             )
-        elif subset == "val" or subset == "test":
+        else:
             self.audio_pipeline = torch.nn.Sequential(
+                FunctionalModule(lambda x: to_mono(x)),
+                FunctionalModule(lambda x: self.mel_transform(x)),
+                FunctionalModule(lambda x: x.squeeze(0) if x.dim() == 3 and x.size(0)==1 else x),
+                FunctionalModule(lambda x: pad_or_trim_mel(x, target_length=3000)),
                 AddNoise(snr_target=snr_target) if snr_target is not None else FunctionalModule(lambda x: x),
                 FunctionalModule(lambda x: torch.nn.functional.layer_norm(x, x.shape, eps=1e-8)),
             )
+
     def _apply_spec_augment(self, mel_spectrogram):
+        # Your existing spec augment implementation
         if len(mel_spectrogram.shape) != 2:
             raise ValueError(f"Expected 2D tensor (time x frequency), got shape {mel_spectrogram.shape}")
         freq_mask_param = 48
@@ -111,8 +148,10 @@ class AudioTransform:
             time_start = int(torch.randint(0, mel_spectrogram.size(0) - time_mask_param, (1,)))
             mel_spectrogram[time_start:time_start + time_mask_param, :] = 0
         return mel_spectrogram
+
     def __call__(self, sample):
         return self.audio_pipeline(sample)
+
 
 class TextTransform:
     def __init__(self, sp_model_path=SP_MODEL_PATH, dict_path=DICT_PATH):

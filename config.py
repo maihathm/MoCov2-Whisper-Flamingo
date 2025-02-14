@@ -21,10 +21,10 @@ MODEL_CONFIG = {
     "fusion_dropout": 0.1,
     "prob_av": 0.5,
     "prob_a": 0.25,
-    "batch_size": 8,
-    "val_batch_size": 8,
+    "batch_size": 4,
+    "val_batch_size": 4,
     "test_batch_size": 1,
-    "num_workers": 4,
+    "num_workers": 0,
     "max_frames": 400,
     "max_frames_val": 400,
     "beam_width": 3,
@@ -39,7 +39,7 @@ TRAIN_CONFIG = {
     "weight_decay": 0.01,
     "gradient_clip_val": 1.0,
     "early_stopping_patience": 10,
-    "accumulate_grad_batches": 2,
+    "accumulate_grad_batches": 4,
     "label_smoothing": 0.1,
 }
 
@@ -67,7 +67,7 @@ AUGMENTATION = {
 }
 
 WHISPER_CONFIG = {
-    "model_name": "SageLiao/whisper-small-zh-TW",
+    "model_name": "openai/whisper-small",
     "freeze_encoder": True,
     "use_flash_attention": True,
     "language": "vietnamese",
@@ -117,7 +117,7 @@ def get_config():
                 "root_dir": DATA_ROOT,
             }),
             "modality": "audiovisual",
-            "updated_tokenizer_dir": "TW_tokenizer"
+            # "updated_tokenizer_dir": "TW_tokenizer"
         }),
         "model": DotDict({
             "d_model": MODEL_CONFIG["d_model"],

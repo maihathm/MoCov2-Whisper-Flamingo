@@ -16,13 +16,27 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "6"
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+def is_deepcopyable(obj):
+    try:
+        copy.deepcopy(obj)
+        return True
+    except Exception:
+        return False
 class AVSRModule(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.save_hyperparameters()
+        hparams = {}
+        for section, params in config.items():
+            if isinstance(params, dict):
+                for key, value in params.items():
+                    if is_deepcopyable(value):
+                        hparams[f"{section}_{key}"] = value
+            else:
+                if is_deepcopyable(params):
+                    hparams[section] = params
+        self.save_hyperparameters(hparams)
         
         # Model configuration
         model_args = (
@@ -265,7 +279,8 @@ def main():
         gradient_clip_val=config["training"]["gradient_clip_val"],
         accumulate_grad_batches=config["training"]["accumulate_grad_batches"],
         log_every_n_steps=config["output"]["log_every_n_steps"],
-        deterministic=True
+        deterministic=True,
+        # fast_dev_run = True,
     )
     
     # Train and test
