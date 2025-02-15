@@ -63,8 +63,9 @@ class VideoTransform:
         self.subset = subset
         if subset == "train":
             self.transforms = [
-                ("resize_64", FunctionalModule(lambda x: F.resize(x, (64,64)))),
-                ("to_float", FunctionalModule(lambda x: x / 255.0)),
+                ("resize_64", FunctionalModule(lambda x: torch.nn.functional.interpolate(
+                    x, size=(64,64), mode="bilinear", align_corners=False
+                ))),
                 ("normalize_0_1", FunctionalModule(lambda x: x / 255.0)),
                 ("random_flip", torchvision.transforms.RandomHorizontalFlip(p=0.5)),
                 ("color_jitter", torchvision.transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)),
@@ -74,11 +75,10 @@ class VideoTransform:
             ]
         elif subset == "val" or subset == "test":
             self.video_pipeline = torch.nn.Sequential(
-                ("resize_64", FunctionalModule(lambda x: F.resize(x, (64,64)))),
-                FunctionalModule(lambda x: x / 255.0),
                 FunctionalModule(lambda x: torch.nn.functional.interpolate(
                     x, size=(64,64), mode="bilinear", align_corners=False
                 )),
+                FunctionalModule(lambda x: x / 255.0),
                 torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             )
     def __call__(self, sample):

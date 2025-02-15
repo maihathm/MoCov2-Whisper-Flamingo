@@ -92,7 +92,7 @@ OUTPUT_CONFIG = {
         "log_weights": True,
         "log_gates": True
     },
-    "enable_logging": True
+    "enable_logging": False
 }
 
 class DotDict(dict):
