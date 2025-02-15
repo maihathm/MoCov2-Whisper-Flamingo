@@ -10,7 +10,7 @@ class LayerNorm(nn.LayerNorm):
         return super().forward(x.float()).type(x.dtype)
 
 class GatedCrossAttentionBlock(nn.Module):
-    def __init__(self, d_model, n_heads, dropout=0.1, enable_logging=True):
+    def __init__(self, d_model, n_heads, dropout=0.1, enable_logging=False):
         super().__init__()
         self.enable_logging = enable_logging
         self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True)
@@ -50,7 +50,7 @@ class GatedCrossAttentionBlock(nn.Module):
         return x
 
 class GatedCrossModalFusion(nn.Module):
-    def __init__(self, d_model, n_heads, n_layers, dropout=0.1, enable_logging=True):
+    def __init__(self, d_model, n_heads, n_layers, dropout=0.1, enable_logging=False):
         super().__init__()
         self.enable_logging = enable_logging
         self.audio_proj = nn.Linear(d_model, d_model)

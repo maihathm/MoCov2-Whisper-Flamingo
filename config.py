@@ -12,18 +12,18 @@ MODEL_CONFIG = {
     "d_model": 512,
     "n_heads": 8,
     "n_layers": 6,
-    "pe_max_len": 5000,
+    "pe_max_len": 3000,
     "fc_hidden_size": 2048,
     "dropout": 0.1,
     "required_input_length": 96,
     "rate_ratio": 640,
-    "fusion_layers": 8,
+    "fusion_layers": 6,
     "fusion_dropout": 0.1,
     "prob_av": 0.5,
     "prob_a": 0.25,
     "batch_size": 4,
-    "val_batch_size": 4,
-    "test_batch_size": 1,
+    "val_batch_size": 2,
+    "test_batch_size": 2,
     "num_workers": 0,
     "max_frames": 400,
     "max_frames_val": 400,
@@ -139,6 +139,8 @@ def get_config():
             "devices": torch.cuda.device_count() if torch.cuda.is_available() else 1,
         }),
     })
+
     os.makedirs(config["output"]["checkpoint_dir"], exist_ok=True)
     os.makedirs(config["output"]["log_dir"], exist_ok=True)
+
     return config

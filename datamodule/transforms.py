@@ -7,6 +7,7 @@ import torch
 import torchaudio
 import torchvision
 from utils.logging_utils import log_tensor_info
+import torchvision.transforms.functional as F
 
 NOISE_FILENAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "babble_noise.wav")
 SP_MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "spm", "unigram", "unigram3370.model")
@@ -62,6 +63,8 @@ class VideoTransform:
         self.subset = subset
         if subset == "train":
             self.transforms = [
+                ("resize_64", FunctionalModule(lambda x: F.resize(x, (64,64)))),
+                ("to_float", FunctionalModule(lambda x: x / 255.0)),
                 ("normalize_0_1", FunctionalModule(lambda x: x / 255.0)),
                 ("random_flip", torchvision.transforms.RandomHorizontalFlip(p=0.5)),
                 ("color_jitter", torchvision.transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)),
@@ -71,7 +74,11 @@ class VideoTransform:
             ]
         elif subset == "val" or subset == "test":
             self.video_pipeline = torch.nn.Sequential(
+                ("resize_64", FunctionalModule(lambda x: F.resize(x, (64,64)))),
                 FunctionalModule(lambda x: x / 255.0),
+                FunctionalModule(lambda x: torch.nn.functional.interpolate(
+                    x, size=(64,64), mode="bilinear", align_corners=False
+                )),
                 torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             )
     def __call__(self, sample):
@@ -135,20 +142,42 @@ class AudioTransform:
             )
 
     def _apply_spec_augment(self, mel_spectrogram):
-        # Your existing spec augment implementation
+        """
+        Thực hiện SpecAugment trên mel_spectrogram (time x freq).
+        """
         if len(mel_spectrogram.shape) != 2:
             raise ValueError(f"Expected 2D tensor (time x frequency), got shape {mel_spectrogram.shape}")
+
+        # Số lần mask tần số
         freq_mask_param = 48
         num_freq_masks = 2
+
+        # Thực hiện freq mask
+        freq_dim = mel_spectrogram.size(1)
         for _ in range(num_freq_masks):
-            freq_start = int(torch.randint(0, mel_spectrogram.size(1) - freq_mask_param, (1,)))
-            mel_spectrogram[:, freq_start:freq_start + freq_mask_param] = 0
-        time_mask_param = mel_spectrogram.size(0) // 8
+            # Nếu freq_dim <= freq_mask_param => bỏ qua mask
+            max_freq_start = freq_dim - freq_mask_param
+            if max_freq_start <= 0:
+                # Không mask vì phạm vi âm/0
+                continue
+            freq_start = int(torch.randint(0, max_freq_start, (1,)))
+            mel_spectrogram[:, freq_start:freq_start+freq_mask_param] = 0
+
+        # Tương tự cho time
+        time_mask_param = mel_spectrogram.size(0) // 8  # vd
         num_time_masks = 2
+        time_dim = mel_spectrogram.size(0)
+
         for _ in range(num_time_masks):
-            time_start = int(torch.randint(0, mel_spectrogram.size(0) - time_mask_param, (1,)))
-            mel_spectrogram[time_start:time_start + time_mask_param, :] = 0
+            max_time_start = time_dim - time_mask_param
+            if max_time_start <= 0:
+                # bỏ qua mask
+                continue
+            time_start = int(torch.randint(0, max_time_start, (1,)))
+            mel_spectrogram[time_start:time_start+time_mask_param, :] = 0
+
         return mel_spectrogram
+
 
     def __call__(self, sample):
         return self.audio_pipeline(sample)

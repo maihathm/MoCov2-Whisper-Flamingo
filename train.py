@@ -1,3 +1,4 @@
+# train.py
 import os
 import copy
 import torch
@@ -7,26 +8,48 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.strategies import DDPStrategy
-from config import get_config
-from datamodule.data_module import DataModule
-from models.av_net import AVNet
 from jiwer import wer
 from transformers import WhisperProcessor
 import logging
 
+from config import get_config
+from datamodule.data_module import DataModule
+from models.av_net import AVNet
+torch.use_deterministic_algorithms(False)
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ""
 logger = logging.getLogger(__name__)
 
+# Optional: fix GPU
 os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+
+
 def is_deepcopyable(obj):
     try:
         copy.deepcopy(obj)
         return True
     except Exception:
         return False
+
 class AVSRModule(pl.LightningModule):
-    def __init__(self, config):
+    """
+    Audio-Visual Speech Recognition Module (Lightning).
+    Includes:
+    - forward pass on AVNet
+    - CTC + CE losses
+    - decoding + WER for validation/test
+    """
+    def __init__(self, config, processor, vocab_size=None):
         super().__init__()
         self.config = config
+        self.processor = processor
+
+        # Nếu chưa truyền vocab_size -> Lấy len(processor.tokenizer)
+        if vocab_size is None:
+            self.vocab_size = len(self.processor.tokenizer)
+        else:
+            self.vocab_size = vocab_size
+
+        # Save hyperparameters for logging
         hparams = {}
         for section, params in config.items():
             if isinstance(params, dict):
@@ -37,7 +60,7 @@ class AVSRModule(pl.LightningModule):
                 if is_deepcopyable(params):
                     hparams[section] = params
         self.save_hyperparameters(hparams)
-        
+
         # Model configuration
         model_args = (
             config["model"]["d_model"],
@@ -47,82 +70,118 @@ class AVSRModule(pl.LightningModule):
             config["model"]["fc_hidden_size"],
             config["model"]["dropout"]
         )
-        
-        # Initialize model
+
+        # Initialize AVNet
         self.model = AVNet(
             modal=config["data"]["modality"],
             MoCofile=os.path.join(os.getcwd(), config["data"]["moco_file"]),
             reqInpLen=config["model"]["required_input_length"],
             modelargs=model_args,
-            vocab_size=WhisperProcessor.from_pretrained("openai/whisper-small").tokenizer.vocab_size,
+            vocab_size=self.vocab_size,  # QUAN TRỌNG
             enable_logging=config["output"]["enable_logging"]
         )
-        
-        # Loss functions
-        self.ctc_loss = nn.CTCLoss(blank=0, reduction='mean', zero_infinity=True)
-        self.cross_entropy = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=config["training"]["label_smoothing"])
-        
-        # Initialize tokenizer
-        tokenizer_dir = config["data"].get("updated_tokenizer_dir", None)
-        if tokenizer_dir and os.path.exists(tokenizer_dir):
-            self.tokenizer_name = tokenizer_dir
-        else:
-            self.tokenizer_name = "openai/whisper-small"
-            if tokenizer_dir:
-                os.makedirs(tokenizer_dir, exist_ok=True)
-                WhisperProcessor.from_pretrained("openai/whisper-small").save_pretrained(tokenizer_dir)
-        
-        self.processor = WhisperProcessor.from_pretrained(self.tokenizer_name)
-        self.vocab_size = self.processor.tokenizer.vocab_size
-    
+
+        # 2 losses: CTC, CE
+        self.ctc_loss = nn.CTCLoss(
+            blank=0, 
+            reduction='mean',
+            zero_infinity=True
+        )
+        self.cross_entropy = nn.CrossEntropyLoss(
+            ignore_index=-100,
+            label_smoothing=config["training"]["label_smoothing"]
+        )
+
     def _compute_ctc_loss(self, logits, targets, input_lengths, target_lengths):
-        log_probs = F.log_softmax(logits, dim=-1)
-        loss = self.ctc_loss(log_probs.transpose(0, 1), targets, input_lengths, target_lengths)
-        return loss
+        """
+        logits shape: [B, T, vocab_size]
+        => ctc expects [T, B, vocab_size]
+        """
+        log_probs = F.log_softmax(logits, dim=-1).transpose(0,1)  # => [T, B, vocab_size]
+        return self.ctc_loss(log_probs, targets, input_lengths, target_lengths)
 
     def _compute_ce_loss(self, logits, targets):
-        return self.cross_entropy(logits.view(-1, self.vocab_size), targets.view(-1))
+        """
+        logits: [B, T_pred, vocab_size]
+        targets: [B, T_gt]
+        -> cắt/pad sao cho T_pred == T_gt (hoặc min)
+        """
+        B, T_pred, _ = logits.shape
+        T_gt = targets.shape[1]
+
+        T_min = min(T_pred, T_gt)
+        trimmed_logits = logits[:, :T_min, :]    # [B, T_min, vocab_size]
+        trimmed_targets = targets[:, :T_min]     # [B, T_min]
+
+        # Debug check
+        t_min_id = trimmed_targets.min().item()
+        t_max_id = trimmed_targets.max().item()
+        if t_min_id < -100 or t_max_id >= self.vocab_size:
+            print(f"[DEBUG] Out-of-range token. min_id={t_min_id}, max_id={t_max_id}, vocab_size={self.vocab_size}")
+            # raise ValueError("Found out-of-range token ID in targets")
+
+        # Flatten
+        trimmed_logits = trimmed_logits.reshape(-1, self.vocab_size)  # [B*T_min, vocab_size]
+        trimmed_targets = trimmed_targets.reshape(-1)                 # [B*T_min]
+
+        ce_loss = self.cross_entropy(trimmed_logits, trimmed_targets)
+        return ce_loss
 
     def _decode_predictions(self, logits):
+        """
+        Decode using self.processor
+        logits: [B, T, vocab_size]
+        => predictions: [B, T]
+        => text
+        """
         predictions = torch.argmax(logits, dim=-1)
-        return self.processor.batch_decode(predictions, skip_special_tokens=True)
+        return self.processor.tokenizer.batch_decode(
+            predictions,
+            skip_special_tokens=True
+        )
 
     def training_step(self, batch, batch_idx):
-        # Forward pass
-        input_data = (
-            batch["audio"], batch["audio_mask"],
-            batch["video"], batch["video_mask"]
-        )
+        """
+        - forward
+        - ctc loss + ce loss
+        - log
+        """
+        audio, audio_mask = batch["audio"], batch["audio_mask"]
+        video, video_mask = batch["video"], batch["video_mask"]
+        video_len = batch["video_lengths"]
+
+        input_data = (audio, audio_mask, video, video_mask, video_len)
         logits = self.model(input_data)
-        
-        # Compute losses
+
+        # ctc
         ctc_loss = self._compute_ctc_loss(
-            logits, 
+            logits,
             batch["target_ids"],
             batch["audio_lengths"],
             batch["target_lengths"]
         )
+        # ce
         ce_loss = self._compute_ce_loss(logits, batch["target_ids"])
-        
-        # Combined loss
         loss = ctc_loss + ce_loss
-        
-        # Logging
+
         self.log("train/ctc_loss", ctc_loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train/ce_loss", ce_loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # Forward pass
-        input_data = (
-            batch["audio"], batch["audio_mask"],
-            batch["video"], batch["video_mask"]
-        )
+        """
+        - forward
+        - ctc + ce
+        - decode WER
+        """
+        audio, audio_mask = batch["audio"], batch["audio_mask"]
+        video, video_mask = batch["video"], batch["video_mask"]
+        video_len = batch["video_lengths"]
+
+        input_data = (audio, audio_mask, video, video_mask, video_len)
         logits = self.model(input_data)
-        
-        # Compute losses
+
         ctc_loss = self._compute_ctc_loss(
             logits,
             batch["target_ids"],
@@ -131,44 +190,32 @@ class AVSRModule(pl.LightningModule):
         )
         ce_loss = self._compute_ce_loss(logits, batch["target_ids"])
         loss = ctc_loss + ce_loss
-        
-        # Compute WER
-        predictions = self._decode_predictions(logits)
-        val_wer = wer(batch["target_text"], predictions)
-        
-        # Logging
+
+        preds = self._decode_predictions(logits)
+        val_wer = wer(batch["target_text"], preds)
+
         self.log("val/ctc_loss", ctc_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val/ce_loss", ce_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val/wer", val_wer, on_step=False, on_epoch=True, prog_bar=True)
-        
+
         return {"val_loss": loss, "val_wer": val_wer}
 
     def test_step(self, batch, batch_idx):
-        # Forward pass
-        input_data = (
-            batch["audio"], batch["audio_mask"],
-            batch["video"], batch["video_mask"]
-        )
+        audio, audio_mask = batch["audio"], batch["audio_mask"]
+        video, video_mask = batch["video"], batch["video_mask"]
+        video_len = batch["video_lengths"]
+
+        input_data = (audio, audio_mask, video, video_mask, video_len)
         logits = self.model(input_data)
-        
-        # Compute WER
-        predictions = self._decode_predictions(logits)
-        test_wer = wer(batch["target_text"], predictions)
-        
-        # Logging
+
+        preds = self._decode_predictions(logits)
+        test_wer = wer(batch["target_text"], preds)
         self.log("test/wer", test_wer, on_step=False, on_epoch=True)
-        
-        if self.config["output"]["save_predictions"]:
-            return {
-                "predictions": predictions,
-                "targets": batch["target_text"],
-                "wer": test_wer
-            }
+
         return {"test_wer": test_wer}
 
     def configure_optimizers(self):
-        # Optimizer
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.config["training"]["max_lr"],
@@ -176,11 +223,10 @@ class AVSRModule(pl.LightningModule):
             eps=1e-6,
             weight_decay=self.config["training"]["weight_decay"]
         )
-        
-        # Learning rate scheduler
+
         num_training_steps = self.trainer.estimated_stepping_batches
         num_warmup_steps = int(num_training_steps * self.config["training"]["warmup_ratio"])
-        
+
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=self.config["training"]["max_lr"],
@@ -190,7 +236,6 @@ class AVSRModule(pl.LightningModule):
             final_div_factor=1e4,
             anneal_strategy='linear'
         )
-        
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -200,45 +245,42 @@ class AVSRModule(pl.LightningModule):
             }
         }
 
-    def on_save_checkpoint(self, checkpoint):
-        # Save tokenizer state
-        self.processor.save_pretrained(self.tokenizer_name)
-        checkpoint["tokenizer_dir"] = self.tokenizer_name
-        
-        # Save model configuration
-        checkpoint["config"] = self.config
-        
-        # Log checkpoint saving
-        logger.info(f"Saving checkpoint to {self.tokenizer_name}")
-
-    def on_load_checkpoint(self, checkpoint):
-        # Load tokenizer
-        if "tokenizer_dir" in checkpoint:
-            self.tokenizer_name = checkpoint["tokenizer_dir"]
-            self.processor = WhisperProcessor.from_pretrained(self.tokenizer_name)
-            logger.info(f"Loaded tokenizer from {self.tokenizer_name}")
-        
-        # Load configuration
-        if "config" in checkpoint:
-            self.config.update(checkpoint["config"])
-            logger.info("Loaded model configuration from checkpoint")
-
 
 def main():
-    # Load configuration
+    """
+    Main function for training/testing the AVSR model
+    """
+    # 1. Load config
     config = get_config()
-    
-    # Setup logging
+
+    # 2. Setup logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    
-    # Initialize data module and model
+
+    # 3. (Optionally) init a single WhisperProcessor & add tokens if needed
     logger.info("Initializing data module and model...")
-    data_module = DataModule(config)
-    model = AVSRModule(config)
-    
+
+    # Tạo processor
+    processor = WhisperProcessor.from_pretrained("openai/whisper-small")
+    # Ví dụ thêm token
+    # new_tokens = ["<my_special_1>", "<my_special_2>"]
+    # processor.tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})
+
+    extended_vocab_size = len(processor.tokenizer)
+    logger.info(f"Extended vocab size = {extended_vocab_size}")
+
+    # 4. Initialize DataModule => pass tokenizer_name or pass processor
+    data_module = DataModule(config)  # code assume "tokenizer_name" = openai/whisper-small inside
+
+    # 5. Create model => pass same processor + extended_vocab_size
+    model = AVSRModule(
+        config=config,
+        processor=processor,
+        vocab_size=extended_vocab_size
+    )
+
     # Setup callbacks
     callbacks = [
         ModelCheckpoint(
@@ -257,15 +299,15 @@ def main():
         ),
         LearningRateMonitor(logging_interval="step")
     ]
-    
-    # Configure logger
+
+    # Logger
     tb_logger = TensorBoardLogger(
         save_dir=config["output"]["log_dir"],
         name="avsr_logs",
         default_hp_metric=False
     )
-    
-    # Initialize trainer
+
+    # Trainer
     logger.info("Initializing trainer...")
     trainer = pl.Trainer(
         max_epochs=config["training"]["epochs"],
@@ -279,18 +321,20 @@ def main():
         gradient_clip_val=config["training"]["gradient_clip_val"],
         accumulate_grad_batches=config["training"]["accumulate_grad_batches"],
         log_every_n_steps=config["output"]["log_every_n_steps"],
-        deterministic=True,
-        fast_dev_run = True,
+        deterministic=False,
+        # fast_dev_run=True,  # đặt True để debug nhanh, False để train full
     )
-    
-    # Train and test
+
+    # 6. Fit
     logger.info("Starting training...")
     trainer.fit(model, datamodule=data_module)
-    
+
+    # 7. Test
     logger.info("Starting testing...")
     trainer.test(model, datamodule=data_module)
-    
+
     logger.info("Training and testing completed!")
+
 
 if __name__ == "__main__":
     main()

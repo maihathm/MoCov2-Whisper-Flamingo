@@ -6,7 +6,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000, enable_logging=True):
+    def __init__(self, d_model, max_len=5000, enable_logging=False):
         super().__init__()
         self.enable_logging = enable_logging
         pe = torch.zeros(max_len, d_model)
@@ -28,19 +28,17 @@ class PositionalEncoding(nn.Module):
         return x
 
 class Decoder(nn.Module):
-    def __init__(self, d_model, vocab_size, enable_logging=True):
+    def __init__(self, d_model, vocab_size, enable_logging=False):
         super().__init__()
         self.enable_logging = enable_logging
         self.linear = nn.Linear(d_model, vocab_size)
-        if self.enable_logging:
-            logger.info("Decoder initialized")
+
     def forward(self, x):
+        # x is [B, T, d_model]
         if self.enable_logging:
             logger.info(f"Decoder input shape: {x.shape}")
-        pooled = x.mean(dim=1)
-        if self.enable_logging:
-            logger.info(f"Decoder pooled shape: {pooled.shape}")
-        logits = self.linear(pooled)
+        logits = self.linear(x)  
+        # => shape [B, T, vocab_size], with T > 1
         if self.enable_logging:
             logger.info(f"Decoder logits shape: {logits.shape}")
         return logits

@@ -8,11 +8,11 @@ logger = logging.getLogger(__name__)
 
 class MoCoVisualFrontend(nn.Module):
     def __init__(self, d_model=args["FRONTEND_D_MODEL"], num_classes=args["WORD_NUM_CLASSES"],
-                 frame_length=args["FRAME_LENGTH"], vid_feature_dim=args["VIDEO_FEATURE_SIZE"], enable_logging=True):
+                 frame_length=args["FRAME_LENGTH"], vid_feature_dim=args["VIDEO_FEATURE_SIZE"], enable_logging=False):
         super(MoCoVisualFrontend, self).__init__()
         self.enable_logging = enable_logging
         self.frontend3D = nn.Sequential(
-            nn.Conv3d(3, 64, kernel_size=(5,7,7), stride=(1,2,2), padding=(2,3,3), bias=False),
+            nn.Conv3d(3, 64, kernel_size=(5,3,3), stride=(1,2,2), padding=(2,3,3), bias=False),
             nn.BatchNorm3d(64),
             nn.ReLU(True),
             nn.MaxPool3d(kernel_size=(1,3,3), stride=(1,2,2), padding=(0,1,1))
@@ -38,7 +38,10 @@ class MoCoVisualFrontend(nn.Module):
         B, C, T, H, W = x.shape
         x = x.transpose(1, 2).contiguous()
         x = x.view(B * T, C, H, W)
+
         mask = torch.arange(T, device=x.device).expand(B, T) >= x_len.unsqueeze(1)
+
+
         x = self.MoCoModel(x)
         if self.enable_logging:
             logger.info(f"After MoCo backbone, shape: {x.shape}")
